@@ -1,0 +1,40 @@
+{
+  "dataset_name": "Mouse Trajectories Fixed Length N=256",
+  "max_length_N": 256,
+  "total_episodes_in_db": 1433,
+  "retained_samples_count": 1121,
+  "discarded_exceeded_N": 174,
+  "discarded_micro": 138,
+  "retention_rate_pct": 78.23,
+  "tensor_shapes": {
+    "start_positions": [
+      1121,
+      2
+    ],
+    "target_positions": [
+      1121,
+      2
+    ],
+    "previous_contexts": [
+      1121,
+      2
+    ],
+    "seq_tensors": [
+      1121,
+      256,
+      6
+    ],
+    "padding_masks": [
+      1121,
+      256
+    ]
+  },
+  "features_description": [
+    "dx: normalized step movement in x",
+    "dy: normalized step movement in y",
+    "dt: delta time (ms / 100)",
+    "rem_x: target_x - curr_x",
+    "rem_y: target_y - curr_y",
+    "action_code: 0=move, 1=click_down, 2=click_up, 3=scroll"
+  ]
+}
