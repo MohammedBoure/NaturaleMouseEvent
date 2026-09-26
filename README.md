@@ -13,6 +13,7 @@ An AI-powered system designed to generate biologically authentic, human-like mou
 - **`execute_mouse_action.py`**: Command-line interface (CLI) to execute natural cursor movements, sequences, and dry-run simulations with reach error reporting.
 - **`preprocess_all_sqlite.py`**: Robust, memory-efficient data engineering pipeline that sequentially processes all SQLite telemetry databases (`data/*.sqlite3`), filters non-human / orthogonal grid artifacts, removes time anomalies, and exports unified training datasets (`data/mouse_dataset_fixed_N256_full.npz`).
 - **`prepare_dataset.py`**: Legacy preprocessor for individual session database conversions.
+- **`demo_test.py`**: Interactive demo and testing suite offering interactive terminal selection, dry-run statistical benchmarking, live on-screen waypoint navigation, precision clicking tests, idle wandering simulation, and kinematic trajectory visualization (`trajectory_demo.png`).
 - **`simulate_mouse.py`**: Offline visualizer and simulation script for evaluating model trajectories.
 - **`analyze_dur.py`**: Statistical analysis script measuring step time deltas ($\Delta t$) and episode duration distributions.
 - **`scan_dbs.py`**: Database scanner tool to inspect raw session event counts and sequence lengths across `.sqlite3` files.
@@ -44,4 +45,31 @@ Or with custom parameters and GPU acceleration:
 
 ```bash
 python train_model.py --data data/mouse_dataset_fixed_N256_full.npz --epochs 50 --batch_size 128 --hidden_dim 256 --noise_dim 16 --tf_start 1.0 --tf_end 0.2 --save_path best_model.pth
+```
+
+## Interactive Demo & Testing
+
+Run the interactive test suite:
+
+```bash
+python demo_test.py
+```
+
+Or execute direct automated modes:
+
+```bash
+# 1. Benchmark without moving cursor
+python demo_test.py --mode dry-run --trials 5
+
+# 2. Live cursor test across 4 screen waypoints (3s countdown)
+python demo_test.py --mode live
+
+# 3. Precision navigation and click test
+python demo_test.py --mode click
+
+# 4. Natural idle wandering and micro-tremor test
+python demo_test.py --mode wander
+
+# 5. Generate and export kinematic trajectory graph (trajectory_demo.png)
+python demo_test.py --mode plot
 ```
