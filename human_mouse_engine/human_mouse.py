@@ -1,6 +1,7 @@
 import time
 import os
 import sys
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -185,14 +186,26 @@ class MemoryConditionedMouseGenerator(nn.Module):
 
             kin_step, action_logits, h = self.decoder.forward_step(step_feat, h)
 
-            pred_kinematics.append(kin_step)
-            pred_actions.append(action_logits)
-
             next_dx_dy = kin_step[:, 0:2]
             next_dt = kin_step[:, 2:3]
 
+            # Biomechanical motor recruitment smooth ramp for initial steps (t < 10)
+            # Enforces near-zero initial displacement and bounds initial acceleration (<90,000 px/s^2)
+            if t < 10:
+                tau = (float(t) + 1.0) / 11.0
+                rest_ramp = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
+                v_init = ext_context[:, 0:2]
+                v_init_mag = torch.norm(v_init, dim=-1, keepdim=True)
+                blend = torch.clamp(v_init_mag / 0.15, 0.0, 1.0)
+                step_ramp = (1.0 - blend) * rest_ramp + blend * 1.0
+                next_dx_dy = next_dx_dy * step_ramp
+
+            kin_out = torch.cat([next_dx_dy, next_dt], dim=-1)
+            pred_kinematics.append(kin_out)
+            pred_actions.append(action_logits)
+
             curr_pos = torch.clamp(curr_pos + next_dx_dy, min=-0.1, max=1.1)
-            prev_kin = torch.cat([next_dx_dy, next_dt], dim=-1)
+            prev_kin = kin_out
 
             pred_traj.append(curr_pos)
 
@@ -372,47 +385,46 @@ class HumanMouseSimulator:
         min_dist = float('inf')
         min_step = 0
 
-        # Neuromuscular Tremor Biomechanics:
-        # Human motor execution contains 8-12 Hz physiological tremor (~0.25 - 0.40 px amplitude).
-        # Modeled as an autoregressive Ornstein-Uhlenbeck / AR(1) colored noise process.
+        # 8-12 Hz Physiological Tremor via Ornstein-Uhlenbeck (OU) Continuous Process
+        # dx = -theta * x * dt + sigma * sqrt(dt) * dW
+        theta_ou = 15.0   # Relaxation parameter for 10-12 Hz biological tremor bandwidth
+        sigma_ou = 0.22   # Physiological tremor amplitude (px)
         tremor_x, tremor_y = 0.0, 0.0
-        rho = 0.75  # Correlation factor for ~10-12 Hz oscillation at ~120 Hz sampling
-        tremor_base_std = 0.35  # Biomechanical tremor standard deviation (px)
+        prev_raw_x, prev_raw_y = start_x, start_y
 
         # Step through model output
         for step in range(len(pred_traj)):
-            raw_x = pred_traj[step, 0] * self.display_w
-            raw_y = pred_traj[step, 1] * self.display_h
-
-            if step < 3:
-                alpha = (step + 1) / 3.0
-                x_px = (1 - alpha) * start_x + alpha * raw_x
-                y_px = (1 - alpha) * start_y + alpha * raw_y
-            else:
-                x_px = raw_x
-                y_px = raw_y
+            x_px = float(pred_traj[step, 0] * self.display_w)
+            y_px = float(pred_traj[step, 1] * self.display_h)
 
             # Clamp coordinates to physical screen dimensions
             x_px = max(0.0, min(self.display_w - 1.0, x_px))
             y_px = max(0.0, min(self.display_h - 1.0, y_px))
 
-            dist_to_target = np.hypot(target_x - x_px, target_y - y_px)
+            dist_to_target = float(np.hypot(target_x - x_px, target_y - y_px))
             if dist_to_target < min_dist:
                 min_dist = dist_to_target
                 min_step = step
 
-            # Smoothly damp tremor amplitude as cursor approaches target
-            tremor_damping = min(1.0, max(0.05, dist_to_target / 30.0))
-            eta_x = float(np.random.normal(0, tremor_base_std * tremor_damping))
-            eta_y = float(np.random.normal(0, tremor_base_std * tremor_damping))
-            tremor_x = rho * tremor_x + np.sqrt(1.0 - rho ** 2) * eta_x
-            tremor_y = rho * tremor_y + np.sqrt(1.0 - rho ** 2) * eta_y
+            dt_scaled = float(pred_kin[step, 2]) * 100.0
+            dt_ms = max(5.0, min(dt_scaled, 35.0))
+            dt_sec = dt_ms / 1000.0
 
-            final_x = max(0.0, min(self.display_w - 1.0, x_px + tremor_x))
-            final_y = max(0.0, min(self.display_h - 1.0, y_px + tremor_y))
+            # Instantaneous speed for biomechanical tremor suppression
+            step_disp = np.hypot(x_px - prev_raw_x, y_px - prev_raw_y)
+            cur_speed_px_s = step_disp / max(1e-4, dt_sec)
+            prev_raw_x, prev_raw_y = x_px, y_px
 
-            dt_scaled = pred_kin[step, 2] * 100.0
-            dt_ms = max(4.0, min(float(dt_scaled), 40.0))
+            # Update Ornstein-Uhlenbeck colored noise process
+            decay = max(0.0, 1.0 - theta_ou * dt_sec)
+            noise_std = sigma_ou * math.sqrt(max(1e-4, dt_sec))
+            tremor_x = decay * tremor_x + float(np.random.normal(0.0, noise_std))
+            tremor_y = decay * tremor_y + float(np.random.normal(0.0, noise_std))
+
+            # High ballistic velocities naturally suppress tremor amplitude
+            speed_suppression = 1.0 / (1.0 + (cur_speed_px_s / 300.0) ** 2)
+            final_x = max(0.0, min(self.display_w - 1.0, x_px + tremor_x * speed_suppression))
+            final_y = max(0.0, min(self.display_h - 1.0, y_px + tremor_y * speed_suppression))
 
             action_idx = int(np.argmax(pred_actions[step]))
             action_type = "move"
@@ -435,60 +447,40 @@ class HumanMouseSimulator:
                 break
 
             # Natural stopping condition 2: overshoot detection
-            # If the model reached close proximity (<35px) and has started moving away
-            # for multiple steps, truncate at the closest approach point.
-            if intent > 0.5 and step > min_step + 8 and min_dist < 35.0 and dist_to_target > min_dist + 4.0:
+            if intent > 0.5 and step > min_step + 8 and min_dist < 30.0 and dist_to_target > min_dist + 5.0:
                 trajectory = trajectory[:min_step + 2]
                 break
 
-        # Natural Biological Convergence (Easing Micro-Correction):
-        # If targeted movement ends slightly off-target (> target_radius), smoothly
-        # converge using an exponential decay easing curve with microscopic neuromotor jitter.
-        # NEVER perform a 1-step teleportation snap!
-        if intent > 0.5:
-            curr_x = float(trajectory[-1]["x"])
-            curr_y = float(trajectory[-1]["y"])
-            rem_dist = np.hypot(target_x - curr_x, target_y - curr_y)
+        # Asymptotic Deceleration & Target Settlement:
+        # Eliminates the artificial constant-velocity floor/plateau.
+        # If the model ends within <2.0px, it settles cleanly to v=0.
+        # If corrective submovement is needed (>2.0px), execute a biological
+        # Flash & Hogan (1985) Minimum-Jerk polynomial whose velocity decays to exactly 0.0 px/s.
+        if intent > 0.5 and len(trajectory) > 0:
+            last_pt = trajectory[-1]
+            rem_x = target_x - float(last_pt["x"])
+            rem_y = target_y - float(last_pt["y"])
+            rem_dist = float(np.hypot(rem_x, rem_y))
 
-            if rem_dist > target_radius:
-                max_micro_steps = 35
-                for _ in range(max_micro_steps):
-                    rem_x = target_x - curr_x
-                    rem_y = target_y - curr_y
-                    d = np.hypot(rem_x, rem_y)
-                    if d <= 1.2:
-                        break
+            if rem_dist > 2.0:
+                num_sub_steps = min(14, max(8, int(rem_dist * 1.5)))
+                p0_x, p0_y = float(last_pt["x"]), float(last_pt["y"])
 
-                    # Biological exponential decay easing
-                    alpha = 0.32
-                    jitter_x = float(np.random.normal(0, 0.15))
-                    jitter_y = float(np.random.normal(0, 0.15))
-
-                    dx = alpha * rem_x + jitter_x
-                    dy = alpha * rem_y + jitter_y
-                    step_mag = np.hypot(dx, dy)
-
-                    # Bounded single micro-step displacement (<= 3.5 px) ensures smooth motion
-                    max_step_len = 3.5
-                    if step_mag > max_step_len:
-                        dx = (dx / step_mag) * max_step_len
-                        dy = (dy / step_mag) * max_step_len
-
-                    curr_x += dx
-                    curr_y += dy
-                    curr_x = max(0.0, min(self.display_w - 1.0, curr_x))
-                    curr_y = max(0.0, min(self.display_h - 1.0, curr_y))
-
-                    dt_ms = float(np.random.uniform(6.5, 9.5))
+                for step_k in range(1, num_sub_steps + 1):
+                    tau = step_k / float(num_sub_steps)
+                    # Quintic polynomial: zero velocity and acceleration at tau=0 and tau=1
+                    poly = 10.0 * (tau ** 3) - 15.0 * (tau ** 4) + 6.0 * (tau ** 5)
+                    curr_sub_x = p0_x + rem_x * poly
+                    curr_sub_y = p0_y + rem_y * poly
+                    sub_dt_ms = 10.0 + 8.0 * math.sin(math.pi * tau)
                     trajectory.append({
-                        "x": int(round(curr_x)),
-                        "y": int(round(curr_y)),
-                        "dt_ms": round(dt_ms, 2),
+                        "x": int(round(curr_sub_x)),
+                        "y": int(round(curr_sub_y)),
+                        "dt_ms": round(sub_dt_ms, 2),
                         "type": "move"
                     })
 
-        # Micro-Freeze & Stair-Stepping Elimination:
-        # Merge consecutive identical integer coordinates to prevent zero-velocity stalls
+        # Anti-Stair-Stepping & Redundant Step Compression
         if len(trajectory) > 1:
             filtered_trajectory = [trajectory[0]]
             for s in trajectory[1:]:
@@ -497,6 +489,15 @@ class HumanMouseSimulator:
                     prev["dt_ms"] = round(prev["dt_ms"] + s["dt_ms"], 2)
                 else:
                     filtered_trajectory.append(s)
+
+            # Ensure biological resting state at the target coordinate (v = 0.0 px/s)
+            if intent > 0.5:
+                filtered_trajectory.append({
+                    "x": int(round(target_x)),
+                    "y": int(round(target_y)),
+                    "dt_ms": 15.0,
+                    "type": "move"
+                })
             trajectory = filtered_trajectory
 
         return trajectory

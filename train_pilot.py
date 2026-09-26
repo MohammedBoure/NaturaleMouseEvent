@@ -273,9 +273,6 @@ class MemoryConditionedMouseGenerator(nn.Module):
 
             kin_step, action_logits, h = self.decoder.forward_step(step_feat, h)
 
-            pred_kinematics.append(kin_step)
-            pred_actions.append(action_logits)
-
             if masks is not None:
                 step_mask = masks[:, t:t+1]
             else:
@@ -288,6 +285,21 @@ class MemoryConditionedMouseGenerator(nn.Module):
             else:
                 next_dx_dy = kin_step[:, 0:2]
                 next_dt = kin_step[:, 2:3]
+
+            # Biomechanical motor recruitment smooth ramp for initial steps (t < 10)
+            # Enforces near-zero initial displacement and bounds initial acceleration (<90,000 px/s^2)
+            if t < 10:
+                tau = (float(t) + 1.0) / 11.0
+                rest_ramp = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
+                v_init = ext_context[:, 0:2]
+                v_init_mag = torch.norm(v_init, dim=-1, keepdim=True)
+                blend = torch.clamp(v_init_mag / 0.15, 0.0, 1.0)
+                step_ramp = (1.0 - blend) * rest_ramp + blend * 1.0
+                next_dx_dy = next_dx_dy * step_ramp
+
+            kin_out = torch.cat([next_dx_dy, next_dt], dim=-1)
+            pred_kinematics.append(kin_out)
+            pred_actions.append(action_logits)
 
             curr_pos = torch.clamp(curr_pos + next_dx_dy * step_mask, min=-0.1, max=1.1)
             prev_kin = torch.cat([next_dx_dy * step_mask, next_dt], dim=-1)
@@ -306,28 +318,25 @@ class MemoryConditionedMouseGenerator(nn.Module):
 
 
 # =====================================================================
-# 3. Multi-Objective Kinematic Loss Function with Bio-Jerk Regularization
+# 3. Multi-Objective Kinematic Loss Function with Bio-Jerk & Boundary Losses
 # =====================================================================
 
 class KinematicBioLoss(nn.Module):
     """
-    Multi-Objective Kinematic Loss:
-    1. Displacement Huber Loss (w_disp = 10.0)
-    2. Terminal Reach Penalty (w_reach = 30.0)
-    3. Temporal Cadence Smooth L1 (w_dt = 3.0)
-    4. Bio-Jerk Regularization (w_jerk = 0.05) on 3rd derivative of displacement
-    5. Action Cross-Entropy (w_action = 1.0)
+    Refined Multi-Objective Kinematic Loss:
+    L_total = L_disp + 2.0*L_reach + 0.5*L_time + 0.3*L_jerk + 0.2*L_boundary + 0.5*L_action
     """
-    def __init__(self, w_disp: float = 10.0, w_reach: float = 30.0, w_dt: float = 3.0, w_jerk: float = 0.05, w_action: float = 1.0, beta: float = 0.01):
+    def __init__(self, w_disp: float = 1.0, w_reach: float = 2.0, w_dt: float = 0.5, w_jerk: float = 0.3, w_boundary: float = 0.2, w_action: float = 0.5, beta: float = 0.01):
         super().__init__()
         self.w_disp = w_disp
         self.w_reach = w_reach
         self.w_dt = w_dt
         self.w_jerk = w_jerk
+        self.w_boundary = w_boundary
         self.w_action = w_action
         self.beta = beta
 
-    def forward(self, pred_kin, pred_actions, pred_traj, true_seq, true_target, masks, start_pos):
+    def forward(self, pred_kin, pred_actions, pred_traj, true_seq, true_target, masks, start_pos, ext_context):
         valid_mask_3d = masks.unsqueeze(-1)
         valid_steps = torch.clamp(masks.sum(), min=1.0)
 
@@ -349,17 +358,28 @@ class KinematicBioLoss(nn.Module):
         true_dt = true_seq[:, :, 2]
         loss_dt = F.smooth_l1_loss(pred_dt * masks, true_dt * masks, beta=0.02, reduction='sum') / valid_steps
 
-        # 4. Bio-Jerk Regularization Loss:
-        # Jerk is the 3rd derivative of displacement: j_t = disp_t - 2*disp_{t-1} + disp_{t-2}
+        # 4. Zero-Velocity & Acceleration Boundary Constraints:
+        # Enforces initial displacement to match incoming velocity, and initial acceleration ~ 0
+        expected_disp_0 = ext_context[:, 0:2] * (pred_dt[:, 0:1] * 0.1)
+        loss_boundary_v0 = torch.mean(torch.sum((pred_disp[:, 0] - expected_disp_0) ** 2, dim=-1))
+        loss_boundary_a0 = torch.mean(torch.sum((pred_disp[:, 1] - pred_disp[:, 0]) ** 2, dim=-1))
+        loss_boundary = loss_boundary_v0 + 0.5 * loss_boundary_a0
+
+        # 5. Enhanced Bio-Jerk Regularization & Velocity Total Variation:
+        # Jerk: discrete 3rd derivative of displacement (delta a_t = disp_t - 2*disp_{t-1} + disp_{t-2})
         if pred_disp.size(1) >= 3:
             jerk = pred_disp[:, 2:] - 2.0 * pred_disp[:, 1:-1] + pred_disp[:, :-2]
             jerk_mask = masks[:, 2:].unsqueeze(-1)
-            jerk_norm_sq = torch.sum(jerk ** 2, dim=-1, keepdim=True) * jerk_mask
-            loss_jerk = jerk_norm_sq.sum() / torch.clamp(jerk_mask.sum(), min=1.0)
+            loss_jerk_core = (torch.sum(jerk ** 2, dim=-1, keepdim=True) * jerk_mask).sum() / torch.clamp(jerk_mask.sum(), min=1.0)
+
+            # Total Variation on consecutive displacements to eliminate high-frequency hash
+            disp_diff = torch.abs(pred_disp[:, 1:] - pred_disp[:, :-1]) * masks[:, 1:].unsqueeze(-1)
+            loss_tv = disp_diff.sum() / torch.clamp(masks[:, 1:].sum(), min=1.0)
+            loss_jerk = loss_jerk_core * 10.0 + loss_tv
         else:
             loss_jerk = torch.tensor(0.0, device=start_pos.device)
 
-        # 5. Action Classification Cross-Entropy
+        # 6. Action Classification Cross-Entropy
         true_actions = true_seq[:, :, 5].long()
         flat_logits = pred_actions.reshape(-1, 4)
         flat_targets = true_actions.reshape(-1)
@@ -372,6 +392,7 @@ class KinematicBioLoss(nn.Module):
             self.w_reach * reach_err_l1 +
             self.w_dt * loss_dt +
             self.w_jerk * loss_jerk +
+            self.w_boundary * loss_boundary +
             self.w_action * loss_action
         )
 
@@ -381,6 +402,7 @@ class KinematicBioLoss(nn.Module):
             'reach_px': reach_err_px.item(),
             'loss_dt': loss_dt.item(),
             'loss_jerk': loss_jerk.item(),
+            'loss_boundary': loss_boundary.item(),
             'loss_action': loss_action.item()
         }
 
@@ -446,11 +468,12 @@ def run_pilot_training(
     print(f"[Model] Initialized MemoryConditionedMouseGenerator ({param_count:,} trainable parameters)")
 
     criterion = KinematicBioLoss(
-        w_disp=10.0,
-        w_reach=30.0,
-        w_dt=3.0,
-        w_jerk=0.05,
-        w_action=1.0
+        w_disp=1.0,
+        w_reach=2.0,
+        w_dt=0.5,
+        w_jerk=0.3,
+        w_boundary=0.2,
+        w_action=0.5
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -499,7 +522,8 @@ def run_pilot_training(
                 true_seq=b_seq,
                 true_target=b_tgt,
                 masks=b_mask,
-                start_pos=b_start
+                start_pos=b_start,
+                ext_context=b_ctx
             )
 
             loss.backward()
@@ -545,7 +569,8 @@ def run_pilot_training(
                     true_seq=b_seq,
                     true_target=b_tgt,
                     masks=b_mask,
-                    start_pos=b_start
+                    start_pos=b_start,
+                    ext_context=b_ctx
                 )
 
                 val_loss += loss.item()

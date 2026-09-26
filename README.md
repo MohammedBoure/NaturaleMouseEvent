@@ -19,8 +19,9 @@ An AI-powered system designed to generate biologically authentic, human-like mou
 - **`scan_dbs.py`**: Database scanner tool to inspect raw session event counts and sequence lengths across `.sqlite3` files.
 - **`train_pilot.py`**: Pilot training pipeline with Extended Motion History Context (Kinematic Memory):
   - Integrates 8D inter-episode history context vector $[v_{x0}, v_{y0}, \Delta t_{\text{dwell}}, \Delta x_{\text{jump}}, \Delta y_{\text{jump}}, \text{click\_density}, \text{avg\_dt}, \|\mathbf{v}_0\|]$ to maintain biomechanical momentum continuity across sequential goals.
-  - Multi-objective `KinematicBioLoss` combining Smooth L1 kinematics, endpoint terminal reach, temporal cadence, and 3rd-derivative bio-jerk regularization ($\mathcal{L}_{\text{jerk}} = \frac{1}{T}\sum \|\Delta a_t\|^2$) to prevent sudden trajectory kinks and snaps.
-  - Built-in automated post-training trajectory sanity evaluations across short, medium, and long screen distances.
+  - Multi-objective `KinematicBioLoss` combining Smooth L1 kinematics, endpoint terminal reach, temporal cadence, discrete bio-jerk & total variation regularizer, boundary acceleration constraints ($\mathcal{L}_{\text{boundary}} = \|\Delta p_0 - \mathbf{v}_{\text{init}}\Delta t_0\|^2 + 0.5\|\Delta p_1 - \Delta p_0\|^2$), and Action Cross-Entropy.
+  - Initial 10-step smoothstep muscle recruitment ramp bounding acceleration strictly below $90,000\text{ px/s}^2$ from rest.
+- **`human_mouse.py`**: High-level API and neural trajectory generator featuring 8–12 Hz continuous Ornstein-Uhlenbeck physiological tremor with ballistic suppression, Flash & Hogan (1985) quintic minimum-jerk corrective submovements, terminal $0.00\text{ px/s}$ resting settlement, and sub-millisecond Windows multimedia timer execution.
 - **`models/`**: Directory containing trained PyTorch neural network checkpoints (`pilot_mouse_model.pth`) and its [README.md](file:///D:/git/NaturaleMouseEvent/models/README.md).
 - **`data/`**: Data directory containing preprocessed trajectory datasets (`mouse_dataset_fixed_N256_full.npz`) and its [README.md](file:///D:/git/NaturaleMouseEvent/data/README.md).
 - **`human_mouse_engine/`**: Standalone packaged engine module and CLI utilities with documentation.
