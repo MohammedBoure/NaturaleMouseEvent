@@ -41,6 +41,8 @@ def main():
     parser.add_argument("--click", action="store_true", help="Perform click after moving to target")
     parser.add_argument("--sequence", type=str, help="Sequence of targets separated by semicolon: '400,300;1200,200'")
     parser.add_argument("--demo", action="store_true", help="Run full 10-target AI trajectory demo")
+    parser.add_argument("--wander", action="store_true", help="Demonstrate natural idle wandering behavior")
+    parser.add_argument("--wander_radius", type=int, default=200, help="Radius for wandering movement")
     parser.add_argument("--delay", type=float, default=0.4, help="Delay between sequence targets in seconds")
     parser.add_argument("--no-failsafe", action="store_true", help="Disable PyAutoGUI failsafe mechanism")
     parser.add_argument("--dry-run", action="store_true", help="Force dry-run simulation mode (do not move real mouse)")
@@ -72,6 +74,15 @@ def main():
         mouse.move_sequence(targets, click_targets=args.click, delay_between=args.delay)
         print(f"\n ✅ Successfully executed sequence of {len(targets)} targets!")
 
+    elif args.wander:
+        count = 5
+        print(f"Executing sequence of {count} natural wandering movements (Radius={args.wander_radius})...")
+        for i in range(1, count + 1):
+            print(f"[Wander {i}/{count}] Simulating reading/idle hesitation...")
+            traj = mouse.wander(radius=args.wander_radius, delay_after=args.delay)
+            print(f" ➔ Generated {len(traj)} idle trajectory steps.")
+        print(f"\n ✅ Completed {count} natural wandering actions successfully!")
+
     elif args.x is not None and args.y is not None:
         target = (args.x, args.y)
         print(f"Moving to target {target} (Click={args.click})...")
@@ -79,16 +90,20 @@ def main():
         print(f" ✅ Target reached successfully!")
 
     else:
-        # Default behavior or --demo: run multi-target demonstration
-        print(f"Running multi-target AI demo sequence ({len(DEFAULT_DEMO_TARGETS)} targets)...")
-        for i, target in enumerate(DEFAULT_DEMO_TARGETS, 1):
+        # Full realistic human browsing session: Wander -> Move -> Click -> Wander
+        print(f"Running realistic human session simulation (Wandering + Targeted Clicks)...")
+        for i, target in enumerate(DEFAULT_DEMO_TARGETS[:5], 1):
+            print(f"\n--- [Step {i}/5] ---")
+            print("1. Idle reading / Wandering around current location...")
+            mouse.wander(radius=150, delay_after=0.2)
+            
             start = mouse.get_current_position()
-            print(f"[Target {i}/{len(DEFAULT_DEMO_TARGETS)}] Moving from {start} ➔ {target}...")
-            traj = mouse.move_to(target[0], target[1], click=False, delay_after=args.delay)
-            print(f" ➔ Generated {len(traj)} smooth trajectory steps.")
+            print(f"2. Decisive movement to target {target} and clicking...")
+            traj = mouse.move_to(target[0], target[1], click=args.click, delay_after=args.delay)
+            print(f" ➔ Completed action in {len(traj)} steps.")
 
         print("\n=======================================================")
-        print(f" ✅ ALL {len(DEFAULT_DEMO_TARGETS)} HUMAN AI TRAJECTORIES COMPLETED SUCCESSFULLY! ")
+        print(f" ✅ REALISTIC HUMAN SESSION SIMULATION COMPLETED SUCCESSFULLY! ")
         print("=======================================================\n")
 
 if __name__ == '__main__':

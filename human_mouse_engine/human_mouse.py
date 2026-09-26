@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import torch
 import torch.nn as nn
+import random
 
 # Enable UTF-8 console output on Windows
 if hasattr(sys.stdout, 'reconfigure'):
@@ -27,7 +28,7 @@ except ImportError:
 class ConditioningEncoder(nn.Module):
     def __init__(self, noise_dim=4, hidden_dim=256):
         super(ConditioningEncoder, self).__init__()
-        in_dim = 8 + noise_dim
+        in_dim = 9 + noise_dim
         self.fc = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.SiLU(),
@@ -36,8 +37,8 @@ class ConditioningEncoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-    def forward(self, start_pos, target_pos, prev_context, noise):
-        x = torch.cat([start_pos, target_pos, prev_context, noise], dim=-1)
+    def forward(self, start_pos, target_pos, prev_context, intent, noise):
+        x = torch.cat([start_pos, target_pos, prev_context, intent, noise], dim=-1)
         return self.fc(x)
 
 class HumanMouseGenerator(nn.Module):
@@ -55,12 +56,12 @@ class HumanMouseGenerator(nn.Module):
             nn.Linear(64, out_dim)
         )
 
-    def forward(self, start_pos, target_pos, prev_context, z_noise=None):
+    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None):
         batch_size = start_pos.size(0)
         if z_noise is None:
             z_noise = torch.randn(batch_size, self.noise_dim, device=start_pos.device)
 
-        h0 = self.encoder(start_pos, target_pos, prev_context, z_noise)
+        h0 = self.encoder(start_pos, target_pos, prev_context, intent, z_noise)
         h = h0.unsqueeze(0).repeat(2, 1, 1)
 
         curr_pos = start_pos.clone()
@@ -108,7 +109,7 @@ class HumanMouseSimulator:
 
         self.model.eval()
 
-    def generate_trajectory(self, start_pos, target_pos, prev_context=None):
+    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0):
         sx_norm = start_pos[0] / self.display_w
         sy_norm = start_pos[1] / self.display_h
         tx_norm = target_pos[0] / self.display_w
@@ -116,6 +117,7 @@ class HumanMouseSimulator:
 
         start_t = torch.tensor([[sx_norm, sy_norm]], dtype=torch.float32, device=self.device)
         target_t = torch.tensor([[tx_norm, ty_norm]], dtype=torch.float32, device=self.device)
+        intent_t = torch.tensor([[intent]], dtype=torch.float32, device=self.device)
 
         if prev_context is None:
             ctx_t = torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=self.device)
@@ -123,7 +125,7 @@ class HumanMouseSimulator:
             ctx_t = torch.tensor([[prev_context[0], prev_context[1], prev_context[2], prev_context[3]]], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            pred_seq, pred_traj = self.model(start_t, target_t, ctx_t)
+            pred_seq, pred_traj = self.model(start_t, target_t, ctx_t, intent_t)
 
         pred_seq = pred_seq[0].cpu().numpy()
         pred_traj = pred_traj[0].cpu().numpy()
@@ -193,8 +195,13 @@ class HumanMouse:
     """
     def __init__(self, model_path=None, failsafe=True):
         if model_path is None:
-            default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt")
-            model_path = default_path if os.path.exists(default_path) else "human_mouse_model.pt"
+            # First check current working directory, then script directory
+            if os.path.exists("human_mouse_model.pt"):
+                model_path = os.path.abspath("human_mouse_model.pt")
+            elif os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt")):
+                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt")
+            else:
+                model_path = "human_mouse_model.pt"
 
         if PYAUTOGUI_AVAILABLE:
             self.screen_w, self.screen_h = pyautogui.size()
@@ -215,12 +222,13 @@ class HumanMouse:
             return pyautogui.position()
         return (100, 100)
 
-    def generate_trajectory(self, start_pos, target_pos, prev_context=None):
+    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0):
         """Generates AI trajectory sequence without executing physical mouse movement."""
         return self.simulator.generate_trajectory(
             start_pos=start_pos,
             target_pos=target_pos,
-            prev_context=prev_context if prev_context is not None else self.prev_context
+            prev_context=prev_context if prev_context is not None else self.prev_context,
+            intent=intent
         )
 
     def _execute_trajectory(self, trajectory, perform_click=False, button='left'):
@@ -294,7 +302,7 @@ class HumanMouse:
         """
         start_x, start_y = self.get_current_position()
         ctx = prev_context if prev_context is not None else self.prev_context
-        trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=ctx)
+        trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=ctx, intent=1.0)
 
         self._execute_trajectory(trajectory, perform_click=click, button=button)
         self._update_context(trajectory)
@@ -307,6 +315,21 @@ class HumanMouse:
     def click_at(self, target_x, target_y, button='left', delay_after=0.1, prev_context=None):
         """Moves mouse naturally to (target_x, target_y) and clicks."""
         return self.move_to(target_x, target_y, click=True, button=button, delay_after=delay_after, prev_context=prev_context)
+
+    def wander(self, radius=200, delay_after=0.1):
+        """Generates a natural idle wandering movement around the current area without intending to click."""
+        start_x, start_y = self.get_current_position()
+        target_x = max(0, min(self.screen_w, start_x + random.randint(-radius, radius)))
+        target_y = max(0, min(self.screen_h, start_y + random.randint(-radius, radius)))
+        
+        trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=self.prev_context, intent=0.0)
+        self._execute_trajectory(trajectory, perform_click=False)
+        self._update_context(trajectory)
+
+        if delay_after > 0:
+            time.sleep(delay_after)
+
+        return trajectory
 
     def move_sequence(self, target_list, click_targets=False, delay_between=0.4):
         """Moves mouse smoothly across a sequence of targets (x, y) maintaining momentum context."""

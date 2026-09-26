@@ -9,7 +9,12 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
     if output_dir is None:
         output_dir = os.path.dirname(os.path.abspath(data_dir))
 
-    db_files = glob.glob(os.path.join(data_dir, "*.sqlite3"))
+    if os.path.isfile(data_dir) and data_dir.endswith('.sqlite3'):
+        db_files = [data_dir]
+        output_dir = os.path.dirname(os.path.abspath(data_dir))
+    else:
+        db_files = glob.glob(os.path.join(data_dir, "*.sqlite3"))
+        
     if not db_files:
         print(f"No .sqlite3 files found in {data_dir}")
         return
@@ -43,31 +48,29 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
             session_monitors[s['session_id']] = (float(w), float(h))
 
         cursor.execute("""
-            SELECT session_id, episode_index, COUNT(*) as cnt
+            SELECT session_id, COUNT(*) as cnt
             FROM events
-            GROUP BY session_id, episode_index
-            ORDER BY episode_index ASC
+            GROUP BY session_id
         """)
-        episode_info = cursor.fetchall()
-        total_episodes += len(episode_info)
+        session_info = cursor.fetchall()
 
         prev_context = np.zeros(4, dtype=np.float32)
 
-        for ep in episode_info:
-            sess_id = ep['session_id']
-            ep_idx = ep['episode_index']
-            cnt = ep['cnt']
+        for sess in session_info:
+            sess_id = sess['session_id']
+            cnt = sess['cnt']
 
             if cnt < min_len:
                 discarded_micro += 1
                 continue
 
+            # Fetch all events for the session ordered by time
             rows = cursor.execute("""
                 SELECT t_monotonic_ns, event_type, x, y, dx, dy, button, pressed
                 FROM events
-                WHERE session_id = ? AND episode_index = ?
+                WHERE session_id = ?
                 ORDER BY event_index ASC
-            """, (sess_id, ep_idx)).fetchall()
+            """, (sess_id,)).fetchall()
 
             if not rows or len(rows) < min_len:
                 discarded_micro += 1
@@ -75,22 +78,39 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
 
             W, H = session_monitors.get(sess_id, (1920.0, 1080.0))
 
-            # Chunk the episode into segments of max_len
-            num_chunks = (len(rows) + max_len - 1) // max_len
+            # Group events into 3-second windows
+            window_duration_ns = 3.0 * 1e9
+            windows = []
+            current_window = []
+            window_start_t = rows[0]['t_monotonic_ns']
+
+            for r in rows:
+                if r['t_monotonic_ns'] - window_start_t > window_duration_ns:
+                    if len(current_window) >= min_len:
+                        windows.append(current_window)
+                    current_window = [r]
+                    window_start_t = r['t_monotonic_ns']
+                else:
+                    current_window.append(r)
             
-            for chunk_idx in range(num_chunks):
-                start_idx = chunk_idx * max_len
-                end_idx = min((chunk_idx + 1) * max_len, len(rows))
-                chunk_rows = rows[start_idx:end_idx]
+            if len(current_window) >= min_len:
+                windows.append(current_window)
+                
+            total_episodes += len(windows)
 
-                if len(chunk_rows) < min_len:
-                    discarded_micro += 1
-                    break
+            for win_rows in windows:
+                # Truncate to max_len if necessary
+                if len(win_rows) > max_len:
+                    win_rows = win_rows[:max_len]
+                    
+                # Calculate Intent (1.0 if there is any click/button press in this window)
+                has_click = any(r['event_type'] in ['click', 'button'] for r in win_rows)
+                intent = 1.0 if has_click else 0.0
 
-                start_x = float(chunk_rows[0]['x']) / W
-                start_y = float(chunk_rows[0]['y']) / H
-                target_x = float(chunk_rows[-1]['x']) / W
-                target_y = float(chunk_rows[-1]['y']) / H
+                start_x = float(win_rows[0]['x']) / W
+                start_y = float(win_rows[0]['y']) / H
+                target_x = float(win_rows[-1]['x']) / W
+                target_y = float(win_rows[-1]['y']) / H
 
                 start_pos = np.array([start_x, start_y], dtype=np.float32)
                 target_pos = np.array([target_x, target_y], dtype=np.float32)
@@ -100,27 +120,26 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
                 seq_tensor = np.zeros((max_len, 6), dtype=np.float32)
                 mask = np.zeros(max_len, dtype=np.float32)
 
-                prev_t = chunk_rows[0]['t_monotonic_ns']
-                prev_x = float(chunk_rows[0]['x'])
-                prev_y = float(chunk_rows[0]['y'])
+                prev_t = win_rows[0]['t_monotonic_ns']
+                prev_x = float(win_rows[0]['x'])
+                prev_y = float(win_rows[0]['y'])
 
-                t0 = chunk_rows[0]['t_monotonic_ns']
-                t_end = chunk_rows[-1]['t_monotonic_ns']
+                t0 = win_rows[0]['t_monotonic_ns']
+                t_end = win_rows[-1]['t_monotonic_ns']
                 dur_sec = (t_end - t0) / 1e9
                 
-                # Calculate clicks and average dt for the NEXT context
-                clicks = sum(1 for r in chunk_rows if r['event_type'] in ['click', 'button'])
-                avg_dt_ms = (dur_sec / len(chunk_rows)) * 1000 if len(chunk_rows) > 0 else 0
+                # Calculate metrics for the NEXT context
+                clicks = sum(1 for r in win_rows if r['event_type'] in ['click', 'button'])
+                avg_dt_ms = (dur_sec / len(win_rows)) * 1000 if len(win_rows) > 0 else 0
                 
                 if dur_sec > 0:
-                    total_dx = (chunk_rows[-1]['x'] - chunk_rows[0]['x']) / W
-                    total_dy = (chunk_rows[-1]['y'] - chunk_rows[0]['y']) / H
-                    # 4D Context: [vx, vy, click_density, avg_dt_scaled]
+                    total_dx = (win_rows[-1]['x'] - win_rows[0]['x']) / W
+                    total_dy = (win_rows[-1]['y'] - win_rows[0]['y']) / H
                     prev_context = np.array([total_dx / dur_sec, total_dy / dur_sec, clicks / float(max_len), avg_dt_ms / 100.0], dtype=np.float32)
                 else:
                     prev_context = np.zeros(4, dtype=np.float32)
 
-                for i, r in enumerate(chunk_rows):
+                for i, r in enumerate(win_rows):
                     dt_ms = (r['t_monotonic_ns'] - prev_t) / 1e6
                     dx = (r['x'] - prev_x) / W
                     dy = (r['y'] - prev_y) / H
@@ -137,7 +156,6 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
                     elif r['event_type'] == 'scroll':
                         action_code = 3.0
 
-                    # Cap dt_ms to prevent massive outliers (e.g., max 500ms between steps)
                     dt_ms = min(dt_ms, 500.0)
 
                     seq_tensor[i] = [dx, dy, dt_ms / 100.0, rem_x, rem_y, action_code]
@@ -151,6 +169,7 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
                     "start_pos": start_pos,
                     "target_pos": target_pos,
                     "previous_context": context_vec,
+                    "intent": np.array([intent], dtype=np.float32),
                     "seq_tensor": seq_tensor,
                     "padding_mask": mask
                 })
@@ -168,6 +187,7 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
     start_positions = np.stack([s['start_pos'] for s in retained_samples])
     target_positions = np.stack([s['target_pos'] for s in retained_samples])
     previous_contexts = np.stack([s['previous_context'] for s in retained_samples]) if num_samples > 0 else np.empty((0, 4))
+    intents = np.stack([s['intent'] for s in retained_samples]) if num_samples > 0 else np.empty((0, 1))
     seq_tensors = np.stack([s['seq_tensor'] for s in retained_samples])
     padding_masks = np.stack([s['padding_mask'] for s in retained_samples])
 
@@ -178,6 +198,7 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
         start_positions=start_positions,
         target_positions=target_positions,
         previous_contexts=previous_contexts,
+        intents=intents,
         seq_tensors=seq_tensors,
         padding_masks=padding_masks
     )
@@ -192,6 +213,7 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
             "start_positions": list(start_positions.shape),
             "target_positions": list(target_positions.shape),
             "previous_contexts": list(previous_contexts.shape),
+            "intents": list(intents.shape),
             "seq_tensors": list(seq_tensors.shape),
             "padding_masks": list(padding_masks.shape)
         }
