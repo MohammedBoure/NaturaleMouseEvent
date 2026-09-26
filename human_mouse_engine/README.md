@@ -68,6 +68,7 @@ python execute_mouse_action.py --dry-run --x 500 --y 300
 
 | Option | Type | Description |
 | :--- | :--- | :--- |
+| `--model` | String | Path to custom PyTorch checkpoint (default: auto-discovers `models/pilot_mouse_model.pth`, `best_model.pth`, etc.) |
 | `--x` | Integer | Target X coordinate on screen |
 | `--y` | Integer | Target Y coordinate on screen |
 | `--click` | Flag | Performs a left mouse click after reaching target |

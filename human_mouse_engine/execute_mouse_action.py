@@ -37,6 +37,7 @@ def parse_sequence_string(seq_str):
 
 def main():
     parser = argparse.ArgumentParser(description="AI Natural Human Mouse Action Executor")
+    parser.add_argument("--model", type=str, default=None, help="Path to PyTorch model checkpoint")
     parser.add_argument("--x", type=int, help="Target X coordinate")
     parser.add_argument("--y", type=int, help="Target Y coordinate")
     parser.add_argument("--click", action="store_true", help="Perform click after moving to target")
@@ -52,7 +53,7 @@ def main():
 
     # Initialize HumanMouse engine
     failsafe = not args.no_failsafe
-    mouse = HumanMouse(failsafe=failsafe, dry_run=args.dry_run)
+    mouse = HumanMouse(model_path=args.model, failsafe=failsafe, dry_run=args.dry_run)
 
     print(f"\n=======================================================")
     print(f" 🤖 AI HUMAN MOUSE ACTION EXECUTOR")

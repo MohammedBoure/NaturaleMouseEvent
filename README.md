@@ -49,7 +49,7 @@ python train_model.py --data data/mouse_dataset_fixed_N256_full.npz --epochs 50 
 
 ## Interactive Demo & Testing
 
-Run the interactive test suite:
+Run the interactive test suite (defaults to `models/pilot_mouse_model.pth` with 8D Kinematic Momentum Chaining):
 
 ```bash
 python demo_test.py
@@ -58,18 +58,21 @@ python demo_test.py
 Or execute direct automated modes:
 
 ```bash
-# 1. Benchmark without moving cursor
+# 1. Benchmark with Kinematic Momentum Chaining (Simulation only)
 python demo_test.py --mode dry-run --trials 5
 
-# 2. Live cursor test across 4 screen waypoints (3s countdown)
+# 2. Live cursor test across 4 screen waypoints with dynamic curvature
 python demo_test.py --mode live
 
-# 3. Precision navigation and click test
+# 3. Specify custom model checkpoint
+python demo_test.py --mode live --model models/pilot_mouse_model.pth
+
+# 4. Precision navigation and click test
 python demo_test.py --mode click
 
-# 4. Natural idle wandering and micro-tremor test
+# 5. Natural idle wandering and micro-tremor test
 python demo_test.py --mode wander
 
-# 5. Generate and export kinematic trajectory graph (trajectory_demo.png)
+# 6. Generate and export multi-segment kinematic chained graph (trajectory_demo.png)
 python demo_test.py --mode plot
 ```

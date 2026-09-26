@@ -43,16 +43,25 @@ except ImportError:
 # =====================================================================
 # PyTorch Neural Network Architecture Definitions
 # =====================================================================
+# PyTorch Neural Network Architecture Definitions
+# =====================================================================
 
-class ConditioningEncoder(nn.Module):
-    def __init__(self, noise_dim=16, hidden_dim=256, cond_dim=64, num_layers=2):
-        super(ConditioningEncoder, self).__init__()
+class ExtendedConditioningEncoder(nn.Module):
+    """
+    Encodes start/target coordinates, motion history context (8D or 4D),
+    binary intent, and latent stochastic noise vector into initial GRU state h_0
+    and per-step context embeddings.
+    """
+    def __init__(self, context_dim=8, noise_dim=16, hidden_dim=256, cond_dim=64, num_layers=2):
+        super(ExtendedConditioningEncoder, self).__init__()
+        self.context_dim = context_dim
         self.noise_dim = noise_dim
         self.hidden_dim = hidden_dim
         self.cond_dim = cond_dim
         self.num_layers = num_layers
 
-        in_dim = 2 + 2 + 4 + 1 + noise_dim  # 9 + noise_dim
+        # start(2) + target(2) + ext_context(context_dim) + intent(1) + noise(16)
+        in_dim = 2 + 2 + context_dim + 1 + noise_dim
 
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
@@ -66,18 +75,22 @@ class ConditioningEncoder(nn.Module):
         self.to_h0 = nn.Linear(hidden_dim, num_layers * hidden_dim)
         self.to_context = nn.Linear(hidden_dim, cond_dim)
 
-    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None):
+    def forward(self, start_pos, target_pos, ext_context, intent, z_noise=None):
         B = start_pos.size(0)
         if z_noise is None:
             z_noise = torch.randn(B, self.noise_dim, device=start_pos.device, dtype=start_pos.dtype)
 
-        x = torch.cat([start_pos, target_pos, prev_context, intent, z_noise], dim=-1)
-        feat = self.mlp(x)
+        feat_in = torch.cat([start_pos, target_pos, ext_context, intent, z_noise], dim=-1)
+        feat = self.mlp(feat_in)
 
         h0 = self.to_h0(feat).view(B, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
         cond_embed = self.to_context(feat)
 
         return h0, cond_embed
+
+
+# Backward compatibility alias
+ConditioningEncoder = ExtendedConditioningEncoder
 
 
 class KinematicDecoder(nn.Module):
@@ -127,9 +140,10 @@ class KinematicDecoder(nn.Module):
         return kin_pred, action_logits, h_next
 
 
-class HumanMouseGenerator(nn.Module):
-    def __init__(self, noise_dim=16, hidden_dim=256, cond_dim=64, seq_len=256, num_layers=2, num_classes=4, max_step_delta=0.08):
-        super(HumanMouseGenerator, self).__init__()
+class MemoryConditionedMouseGenerator(nn.Module):
+    def __init__(self, context_dim=8, noise_dim=16, hidden_dim=256, cond_dim=64, seq_len=256, num_layers=2, num_classes=4, max_step_delta=0.08):
+        super(MemoryConditionedMouseGenerator, self).__init__()
+        self.context_dim = context_dim
         self.seq_len = seq_len
         self.noise_dim = noise_dim
         self.hidden_dim = hidden_dim
@@ -138,7 +152,8 @@ class HumanMouseGenerator(nn.Module):
         self.num_classes = num_classes
         self.max_step_delta = max_step_delta
 
-        self.encoder = ConditioningEncoder(
+        self.encoder = ExtendedConditioningEncoder(
+            context_dim=context_dim,
             noise_dim=noise_dim,
             hidden_dim=hidden_dim,
             cond_dim=cond_dim,
@@ -153,9 +168,9 @@ class HumanMouseGenerator(nn.Module):
             max_step_delta=max_step_delta
         )
 
-    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None, teacher_forcing_ratio=0.0, true_seq=None, padding_masks=None):
+    def forward(self, start_pos, target_pos, ext_context, intent, z_noise=None, teacher_forcing_ratio=0.0, true_seq=None, padding_masks=None):
         B = start_pos.size(0)
-        h, cond_embed = self.encoder(start_pos, target_pos, prev_context, intent, z_noise)
+        h, cond_embed = self.encoder(start_pos, target_pos, ext_context, intent, z_noise)
 
         curr_pos = start_pos.clone()
         prev_kin = torch.zeros(B, 3, device=start_pos.device, dtype=start_pos.dtype)
@@ -188,60 +203,108 @@ class HumanMouseGenerator(nn.Module):
         return pred_kinematics, pred_actions, pred_traj
 
 
+# Backward compatibility alias
+HumanMouseGenerator = MemoryConditionedMouseGenerator
+
+
 # =====================================================================
 # Trajectory Simulation Engine
 # =====================================================================
 
 class HumanMouseSimulator:
-    def __init__(self, model_path="human_mouse_model.pt", display_w=1920, display_h=1080):
+    def __init__(self, model_path=None, display_w=1920, display_h=1080):
         self.display_w = float(display_w)
         self.display_h = float(display_h)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.context_dim = 8
 
-        self.model = HumanMouseGenerator(
-            noise_dim=16,
-            hidden_dim=256,
-            cond_dim=64,
-            seq_len=256,
-            num_layers=2,
-            num_classes=4,
-            max_step_delta=0.08
-        ).to(self.device)
-
+        # Dynamic model checkpoint discovery with priority order:
+        # 1. User-supplied model_path
+        # 2. models/pilot_mouse_model.pth (trained extended-context model)
+        # 3. best_model.pth
+        # 4. human_mouse_model.pt
         resolved_path = None
-        candidates = [
-            model_path,
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path),
-            "human_mouse_model.pt",
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+
+        candidate_paths = []
+        if model_path:
+            candidate_paths.extend([
+                model_path,
+                os.path.join(script_dir, model_path)
+            ])
+        candidate_paths.extend([
+            "models/pilot_mouse_model.pth",
+            os.path.join(script_dir, "models/pilot_mouse_model.pth"),
             "best_model.pth",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.pth")
-        ]
-        for p in candidates:
+            os.path.join(script_dir, "best_model.pth"),
+            "human_mouse_model.pt",
+            os.path.join(script_dir, "human_mouse_model.pt"),
+            "human_mouse_engine/human_mouse_model.pt",
+            os.path.join(script_dir, "human_mouse_engine/human_mouse_model.pt")
+        ])
+
+        for p in candidate_paths:
             if p and os.path.exists(p):
-                resolved_path = p
+                resolved_path = os.path.abspath(p)
                 break
 
         if resolved_path:
-            checkpoint = torch.load(resolved_path, map_location=self.device)
+            checkpoint = torch.load(resolved_path, map_location=self.device, weights_only=False)
+
+            # Auto-detect context dimension from checkpoint config or weight shapes
+            detected_context_dim = 8
+            if isinstance(checkpoint, dict) and 'config' in checkpoint:
+                detected_context_dim = checkpoint['config'].get('context_dim', 8)
+            elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                state = checkpoint['model_state_dict']
+                if 'encoder.mlp.0.weight' in state:
+                    detected_context_dim = state['encoder.mlp.0.weight'].shape[1] - 21
+            elif isinstance(checkpoint, dict) and 'encoder.mlp.0.weight' in checkpoint:
+                detected_context_dim = checkpoint['encoder.mlp.0.weight'].shape[1] - 21
+
+            self.context_dim = max(4, detected_context_dim)
+            self.model = MemoryConditionedMouseGenerator(
+                context_dim=self.context_dim,
+                noise_dim=16,
+                hidden_dim=256,
+                cond_dim=64,
+                seq_len=256,
+                num_layers=2,
+                num_classes=4,
+                max_step_delta=0.08
+            ).to(self.device)
+
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 self.model.load_state_dict(checkpoint['model_state_dict'])
             else:
                 self.model.load_state_dict(checkpoint)
-            print(f"[HumanMouse] Loaded trained AI mouse model from: {resolved_path}")
+
+            print(f"[HumanMouse] Loaded trained AI mouse model from: {resolved_path} (context_dim={self.context_dim})")
         else:
+            self.context_dim = 8
+            self.model = MemoryConditionedMouseGenerator(
+                context_dim=8,
+                noise_dim=16,
+                hidden_dim=256,
+                cond_dim=64,
+                seq_len=256,
+                num_layers=2,
+                num_classes=4,
+                max_step_delta=0.08
+            ).to(self.device)
             print(f"[HumanMouse] Warning: Model file {model_path} not found. Using untrained weights.")
 
         self.model.eval()
 
     def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0):
         """
-        Generates realistic human mouse trajectory from start_pos to target_pos.
+        Generates realistic human mouse trajectory from start_pos to target_pos
+        conditioned on continuous kinematic memory context.
         
         Args:
             start_pos: Tuple (x, y) in screen coordinates.
             target_pos: Tuple (x, y) in screen coordinates.
-            prev_context: Optional 4D context tuple (vx, vy, click_density, avg_dt).
+            prev_context: Optional context tuple (8D or 4D) carrying residual momentum.
             intent: 1.0 for targeted movement/click, 0.0 for idle wandering.
             target_radius: Acceptable distance threshold (in px) to consider target reached.
             
@@ -270,10 +333,24 @@ class HumanMouseSimulator:
         target_t = torch.tensor([[tx_norm, ty_norm]], dtype=torch.float32, device=self.device)
         intent_t = torch.tensor([[intent]], dtype=torch.float32, device=self.device)
 
+        # Context alignment across 8D and 4D representations
         if prev_context is None:
-            ctx_t = torch.tensor([[0.0, 0.0, 0.0, 0.0]], dtype=torch.float32, device=self.device)
+            if self.context_dim == 8:
+                ctx_arr = [0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0]
+            else:
+                ctx_arr = [0.0, 0.0, 0.0, 0.1]
+        elif len(prev_context) == 4 and self.context_dim == 8:
+            vx0, vy0, clicks, avg_dt = prev_context
+            mag = float(np.hypot(vx0, vy0))
+            ctx_arr = [float(vx0), float(vy0), 0.1, 0.0, 0.0, float(clicks), float(avg_dt), mag]
+        elif len(prev_context) == 8 and self.context_dim == 4:
+            ctx_arr = [float(prev_context[0]), float(prev_context[1]), float(prev_context[5]), float(prev_context[6])]
+        elif len(prev_context) == self.context_dim:
+            ctx_arr = [float(c) for c in prev_context]
         else:
-            ctx_t = torch.tensor([[prev_context[0], prev_context[1], prev_context[2], prev_context[3]]], dtype=torch.float32, device=self.device)
+            ctx_arr = [float(c) for c in list(prev_context)[:self.context_dim]]
+
+        ctx_t = torch.tensor([ctx_arr], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             pred_kin, pred_actions, pred_traj = self.model(
@@ -436,14 +513,7 @@ class HumanMouse:
     def __init__(self, model_path=None, failsafe=True, dry_run=False):
         self.dry_run = dry_run
         self.failsafe = failsafe
-        if model_path is None:
-            # First check current working directory, then script directory
-            if os.path.exists("human_mouse_model.pt"):
-                model_path = os.path.abspath("human_mouse_model.pt")
-            elif os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt")):
-                model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt")
-            else:
-                model_path = "human_mouse_model.pt"
+        # Simulator will prioritize user model_path, then models/pilot_mouse_model.pth, best_model.pth, etc.
 
         if PYAUTOGUI_AVAILABLE:
             self.screen_w, self.screen_h = pyautogui.size()
@@ -537,48 +607,78 @@ class HumanMouse:
                 except Exception:
                     pass
 
-    def _update_context(self, trajectory):
-        """Calculates 4D velocity/momentum context for continuous smooth movements."""
-        if len(trajectory) > 2:
-            last_dx = (trajectory[-1]['x'] - trajectory[0]['x']) / self.screen_w
-            last_dy = (trajectory[-1]['y'] - trajectory[0]['y']) / self.screen_h
-            total_time_sec = sum(step['dt_ms'] for step in trajectory) / 1000.0
-            clicks = sum(1 for step in trajectory if step['type'] in ['click_down', 'click_up'])
-            avg_dt_ms = (total_time_sec * 1000.0) / len(trajectory)
-
-            if total_time_sec > 0:
-                self.prev_context = (
-                    last_dx / total_time_sec,
-                    last_dy / total_time_sec,
-                    clicks / 256.0,
-                    avg_dt_ms / 100.0
-                )
-            else:
-                self.prev_context = (0.0, 0.0, 0.0, 0.0)
-
-    def set_context(self, vx=0.0, vy=0.0, clicks=0.0, avg_dt=0.1):
+    def compute_terminal_momentum(self, trajectory, dwell_time_sec=0.1, jump_offset=(0.0, 0.0)):
         """
-        Manually sets or overrides the 4D velocity/momentum context vector.
-        Format: (vx, vy, clicks, avg_dt)
+        Computes the residual arrival velocity vector (vx, vy) and builds the full
+        kinematic memory context vector for smooth momentum chaining across waypoints.
         """
-        self.prev_context = (float(vx), float(vy), float(clicks), float(avg_dt))
+        if not trajectory or len(trajectory) < 2:
+            if getattr(self.simulator, 'context_dim', 8) == 8:
+                return (0.0, 0.0, float(dwell_time_sec), 0.0, 0.0, 0.0, 0.1, 0.0)
+            return (0.0, 0.0, 0.0, 0.1)
+
+        # Look at the final 6 to 10 points before any micro-easing to capture arrival velocity
+        k = min(10, len(trajectory) - 1)
+        dx_px = float(trajectory[-1]['x'] - trajectory[-k]['x'])
+        dy_px = float(trajectory[-1]['y'] - trajectory[-k]['y'])
+        dt_sum_sec = float(sum(trajectory[j]['dt_ms'] for j in range(len(trajectory) - k, len(trajectory))) / 1000.0)
+
+        if dt_sum_sec > 1e-4:
+            vx_final = (dx_px / self.screen_w) / dt_sum_sec
+            vy_final = (dy_px / self.screen_h) / dt_sum_sec
+        else:
+            vx_final, vy_final = 0.0, 0.0
+
+        momentum_mag = float(np.hypot(vx_final, vy_final))
+        clicks = float(sum(1 for step in trajectory if step['type'] in ['click_down', 'click_up']) / 256.0)
+        avg_dt = float((sum(step['dt_ms'] for step in trajectory) / len(trajectory)) / 100.0)
+        scaled_dwell = max(0.01, min(1.0, float(dwell_time_sec)))
+
+        if getattr(self.simulator, 'context_dim', 8) == 8:
+            return (
+                float(vx_final),
+                float(vy_final),
+                float(scaled_dwell),
+                float(jump_offset[0] / self.screen_w),
+                float(jump_offset[1] / self.screen_h),
+                float(clicks),
+                float(avg_dt),
+                float(momentum_mag)
+            )
+        else:
+            return (float(vx_final), float(vy_final), float(clicks), float(avg_dt))
+
+    def _update_context(self, trajectory, dwell_time_sec=0.1):
+        """Updates internal momentum context vector from the most recent movement."""
+        self.prev_context = self.compute_terminal_momentum(trajectory, dwell_time_sec=dwell_time_sec)
+
+    def set_context(self, vx=0.0, vy=0.0, dwell_time=0.1, clicks=0.0, avg_dt=0.1):
+        """
+        Manually sets or overrides the velocity/momentum context vector.
+        """
+        mag = float(np.hypot(vx, vy))
+        if getattr(self.simulator, 'context_dim', 8) == 8:
+            self.prev_context = (float(vx), float(vy), float(dwell_time), 0.0, 0.0, float(clicks), float(avg_dt), mag)
+        else:
+            self.prev_context = (float(vx), float(vy), float(clicks), float(avg_dt))
 
     def get_context(self):
-        """Returns current 4D context vector."""
+        """Returns current context vector."""
         return self.prev_context
 
-    def move_to(self, target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None, target_radius=5.0):
+    def move_to(self, target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None, target_radius=5.0, dwell_time=0.1):
         """
         Smoothly moves mouse from current position to (target_x, target_y) naturally using AI.
-        prev_context: Optional 4D tuple (vx, vy, clicks, avg_dt) to override velocity context.
+        prev_context: Optional context tuple to override velocity context.
         target_radius: Distance tolerance (px) to consider destination reached.
+        dwell_time: Inter-waypoint dwell time (sec) for kinematic chaining.
         """
         start_x, start_y = self.get_current_position()
         ctx = prev_context if prev_context is not None else self.prev_context
         trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=ctx, intent=1.0, target_radius=target_radius)
 
         self._execute_trajectory(trajectory, perform_click=click, button=button)
-        self._update_context(trajectory)
+        self._update_context(trajectory, dwell_time_sec=dwell_time)
 
         if delay_after > 0:
             time.sleep(delay_after)
@@ -597,24 +697,30 @@ class HumanMouse:
         
         trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=self.prev_context, intent=0.0)
         self._execute_trajectory(trajectory, perform_click=False)
-        self._update_context(trajectory)
+        self._update_context(trajectory, dwell_time_sec=0.2)
 
         if delay_after > 0:
             time.sleep(delay_after)
 
         return trajectory
 
-    def move_sequence(self, target_list, click_targets=False, delay_between=0.4, target_radius=5.0):
-        """Moves mouse smoothly across a sequence of targets (x, y) maintaining momentum context."""
+    def move_sequence(self, target_list, click_targets=False, delay_between=0.05, target_radius=5.0, continuous_chaining=True):
+        """
+        Moves mouse smoothly across a sequence of targets (x, y) maintaining continuous
+        kinematic momentum chaining to avoid sharp geometric/polygonal turns.
+        """
         results = []
         for i, target in enumerate(target_list):
             target_x, target_y = target
+            is_last = (i == len(target_list) - 1)
+            dwell = 0.20 if is_last else (0.04 if continuous_chaining else 0.15)
             traj = self.move_to(
                 target_x,
                 target_y,
-                click=click_targets,
-                delay_after=delay_between if i < len(target_list) - 1 else 0.0,
-                target_radius=target_radius
+                click=(click_targets if is_last else False),
+                delay_after=(delay_between if not is_last else 0.0),
+                target_radius=target_radius,
+                dwell_time=dwell
             )
             results.append(traj)
         return results
