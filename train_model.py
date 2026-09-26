@@ -5,14 +5,19 @@ Production-grade training script for generating biologically authentic,
 natural human mouse cursor trajectories with behavioral conditioning,
 kinematics, and action classification.
 
-Features:
+Key Architectural & Algorithmic Features:
 - Behavioral Biometrics Conditioning (Start, Target, Momentum Context, Intent, Gaussian Noise)
 - ConditioningEncoder (MLP with LayerNorm & SiLU activations)
 - KinematicDecoder (2-layer GRU with continuous context injection)
-- Dual-Head Output: Kinematics Head (dx, dy, dt) + Action Head (4-class discrete logits)
-- DistanceSmoothLoss: Masked Multi-Objective Loss (Kinematics Huber, Target Reach L1, Jerk Smoothness, Action Cross-Entropy)
-- Scheduled Sampling: Decaying Teacher Forcing ratio to prevent autoregressive drift
-- Checkpointing, Learning Rate Cosine Annealing, Gradient Clipping, and Diagnostic Logging
+- Bounded Kinematics Head: Tanh-bounded (dx, dy) scaling to physically realistic limits
+  and sigmoid-bounded dt to eliminate catastrophic autoregressive trajectory divergence
+- Action Head: 4-class discrete logits (Move, Press, Release, Scroll)
+- Dynamic Closed-Loop State Tracking: Incremental coordinate accumulation and rem_x, rem_y
+  feedback with screen-boundary clamping
+- Masked Multi-Objective DistanceSmoothLoss: Kinematics Huber, Endpoint Reach L1 penalty,
+  Jerk Smoothness (2nd-order differences), and Action Cross-Entropy
+- Scheduled Sampling: Decaying Teacher Forcing ratio across epochs to bridge train-test gap
+- Padded Step Freezing: Zero displacement accumulation on padded frames beyond episode end
 """
 
 import os
@@ -146,21 +151,26 @@ class ConditioningEncoder(nn.Module):
 class KinematicDecoder(nn.Module):
     """
     2-Layer GRU Kinematic Decoder with Dual-Head Output:
-    - Kinematics Head: Outputs (dx, dy, dt)
-    - Action Head: Outputs raw logits for 4 discrete action classes
+    - Kinematics Head: Outputs (dx, dy, dt) strictly bounded via tanh and sigmoid
+      to prevent catastrophic autoregressive displacement runaway.
+    - Action Head: Outputs raw logits for 4 discrete action classes.
     """
     def __init__(
         self,
         hidden_dim: int = 256,
         cond_dim: int = 64,
         num_layers: int = 2,
-        num_classes: int = 4
+        num_classes: int = 4,
+        max_step_delta: float = 0.05,
+        max_dt: float = 5.0
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.cond_dim = cond_dim
         self.num_layers = num_layers
         self.num_classes = num_classes
+        self.max_step_delta = max_step_delta
+        self.max_dt = max_dt
 
         # Step input: [dx, dy, dt, rem_x, rem_y] (5) + cond_embed (cond_dim)
         step_in_dim = 5 + cond_dim
@@ -179,6 +189,10 @@ class KinematicDecoder(nn.Module):
             nn.Linear(64, 3)
         )
 
+        # Gentle weight initialization so initial step predictions begin close to resting velocity
+        nn.init.uniform_(self.kinematics_head[-1].weight, -1e-3, 1e-3)
+        nn.init.zeros_(self.kinematics_head[-1].bias)
+
         # Action Head: outputs logits for 4 discrete actions (Move, Press, Release, Scroll)
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
@@ -192,14 +206,25 @@ class KinematicDecoder(nn.Module):
         h: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Executes a single recurrent step.
+        Executes a single recurrent step with bounded output scaling.
         step_input: (B, 1, step_in_dim)
         h: (num_layers, B, hidden_dim)
         """
         gru_out, h_next = self.gru(step_input, h)
         out_flat = gru_out.squeeze(1)
 
-        kin_pred = self.kinematics_head(out_flat)
+        raw_kin = self.kinematics_head(out_flat)
+
+        # -------------------------------------------------------------
+        # Physical Output Bounding:
+        # dx, dy: Tanh activation scaled to max_step_delta (~0.05 normalized screen units)
+        # dt: Sigmoid activation scaled to max_dt (~5.0, i.e., 500ms max)
+        # -------------------------------------------------------------
+        dx = torch.tanh(raw_kin[:, 0:1]) * self.max_step_delta
+        dy = torch.tanh(raw_kin[:, 1:2]) * self.max_step_delta
+        dt = torch.sigmoid(raw_kin[:, 2:3]) * self.max_dt
+
+        kin_pred = torch.cat([dx, dy, dt], dim=-1)
         action_logits = self.action_head(out_flat)
 
         return kin_pred, action_logits, h_next
@@ -208,8 +233,11 @@ class KinematicDecoder(nn.Module):
 class HumanMouseGenerator(nn.Module):
     """
     Full AI Natural Human Mouse Model.
-    Combines ConditioningEncoder and KinematicDecoder with support for
-    both Scheduled Sampling during training and pure autoregressive free-running rollout during inference.
+    Combines ConditioningEncoder and KinematicDecoder with support for:
+    - Bounded kinematic outputs preventing runaway compound error
+    - Closed-loop dynamic coordinate & rem_x, rem_y state tracking
+    - Vectorized scheduled sampling per batch item
+    - Trajectory reconstruction with padding step freezing
     """
     def __init__(
         self,
@@ -218,7 +246,8 @@ class HumanMouseGenerator(nn.Module):
         cond_dim: int = 64,
         seq_len: int = 256,
         num_layers: int = 2,
-        num_classes: int = 4
+        num_classes: int = 4,
+        max_step_delta: float = 0.05
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -227,6 +256,7 @@ class HumanMouseGenerator(nn.Module):
         self.cond_dim = cond_dim
         self.num_layers = num_layers
         self.num_classes = num_classes
+        self.max_step_delta = max_step_delta
 
         self.encoder = ConditioningEncoder(
             noise_dim=noise_dim,
@@ -239,7 +269,8 @@ class HumanMouseGenerator(nn.Module):
             hidden_dim=hidden_dim,
             cond_dim=cond_dim,
             num_layers=num_layers,
-            num_classes=num_classes
+            num_classes=num_classes,
+            max_step_delta=max_step_delta
         )
 
     def forward(
@@ -250,7 +281,8 @@ class HumanMouseGenerator(nn.Module):
         intent: torch.Tensor,
         z_noise: Optional[torch.Tensor] = None,
         teacher_forcing_ratio: float = 0.0,
-        true_seq: Optional[torch.Tensor] = None
+        true_seq: Optional[torch.Tensor] = None,
+        padding_masks: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Autoregressive rollout over seq_len timesteps.
@@ -263,6 +295,7 @@ class HumanMouseGenerator(nn.Module):
             z_noise: Optional (B, noise_dim) latent stochastic vector
             teacher_forcing_ratio: float in [0.0, 1.0] for scheduled sampling
             true_seq: Optional (B, seq_len, 6) ground truth sequence for teacher forcing
+            padding_masks: Optional (B, seq_len) binary mask for valid vs padded steps
 
         Returns:
             pred_kinematics: (B, seq_len, 3) -> [dx, dy, dt]
@@ -282,38 +315,41 @@ class HumanMouseGenerator(nn.Module):
         use_tf = (teacher_forcing_ratio > 0.0 and true_seq is not None and self.training)
 
         for t in range(self.seq_len):
-            rem = target_pos - curr_pos
+            # Dynamic closed-loop remaining distance feedback (clamped to [-1.0, 1.0])
+            rem = torch.clamp(target_pos - curr_pos, min=-1.0, max=1.0)
             step_feat = torch.cat([prev_kin, rem, cond_embed], dim=-1).unsqueeze(1)
 
-            kin_pred, action_logits, h = self.decoder.forward_step(step_feat, h)
-
-            dx = kin_pred[:, 0:1]
-            dy = kin_pred[:, 1:2]
-            # Ensure physical timing delta is non-negative
-            dt = F.softplus(kin_pred[:, 2:3])
-            kin_step = torch.cat([dx, dy, dt], dim=-1)
+            # GRU step output
+            kin_step, action_logits, h = self.decoder.forward_step(step_feat, h)
 
             pred_kinematics.append(kin_step)
             pred_actions.append(action_logits)
 
-            # Scheduled sampling decision for the next step's input
-            if use_tf and random.random() < teacher_forcing_ratio:
-                # Teacher forcing: feed ground truth step displacement
-                next_dx = true_seq[:, t, 0:1]
-                next_dy = true_seq[:, t, 1:2]
-                next_dt = true_seq[:, t, 2:3]
-                curr_pos = curr_pos + torch.cat([next_dx, next_dy], dim=-1)
-                prev_kin = torch.cat([next_dx, next_dy, next_dt], dim=-1)
+            # Step mask: freeze updates if padded step
+            if padding_masks is not None:
+                step_mask = padding_masks[:, t:t+1]
             else:
-                # Autoregressive rollout: feed model's predicted displacement
-                curr_pos = curr_pos + torch.cat([dx, dy], dim=-1)
-                prev_kin = kin_step
+                step_mask = torch.ones(B, 1, device=start_pos.device, dtype=start_pos.dtype)
+
+            # Scheduled sampling: vectorized coin flip per batch element
+            if use_tf:
+                tf_coin = (torch.rand(B, 1, device=start_pos.device) < teacher_forcing_ratio).float()
+                next_dx_dy = tf_coin * true_seq[:, t, 0:2] + (1.0 - tf_coin) * kin_step[:, 0:2]
+                next_dt = tf_coin * true_seq[:, t, 2:3] + (1.0 - tf_coin) * kin_step[:, 2:3]
+            else:
+                next_dx_dy = kin_step[:, 0:2]
+                next_dt = kin_step[:, 2:3]
+
+            # Accumulate displacement only on valid steps and clamp coordinates to screen safety boundary
+            disp_update = next_dx_dy * step_mask
+            curr_pos = torch.clamp(curr_pos + disp_update, min=-0.1, max=1.1)
+            prev_kin = torch.cat([next_dx_dy * step_mask, next_dt], dim=-1)
 
             pred_traj.append(curr_pos)
 
-        pred_kinematics = torch.stack(pred_kinematics, dim=1)
-        pred_actions = torch.stack(pred_actions, dim=1)
-        pred_traj = torch.stack(pred_traj, dim=1)
+        pred_kinematics = torch.stack(pred_kinematics, dim=1) # (B, seq_len, 3)
+        pred_actions = torch.stack(pred_actions, dim=1)       # (B, seq_len, 4)
+        pred_traj = torch.stack(pred_traj, dim=1)             # (B, seq_len, 2)
 
         return pred_kinematics, pred_actions, pred_traj
 
@@ -338,7 +374,8 @@ class HumanMouseGenerator(nn.Module):
             intent=intent,
             z_noise=z_noise,
             teacher_forcing_ratio=0.0,
-            true_seq=None
+            true_seq=None,
+            padding_masks=None
         )
         self.train(was_training)
         return outputs
@@ -352,7 +389,8 @@ class DistanceSmoothLoss(nn.Module):
     """
     Masked Multi-Task Kinematic Trajectory Loss:
     - Kinematics Loss: Masked Huber (Smooth L1) loss on (dx, dy, dt).
-    - Target Reach Loss: L1 penalty between accumulated position and actual target at final valid step.
+    - Target Reach Loss: L1 penalty between accumulated (sum dx, sum dy) and the actual (x_tgt - x_0)
+      at the final valid timestep.
     - Jerk / Smoothness Penalty: Penalize 2nd-order differences of step displacements (acceleration variation).
     - Action Classification Loss: Masked Cross-Entropy for 4-class discrete actions.
     - Masking: Padded steps (padding_mask == 0) have strictly zero contribution to all losses.
@@ -360,7 +398,7 @@ class DistanceSmoothLoss(nn.Module):
     def __init__(
         self,
         w_kin: float = 10.0,
-        w_reach: float = 15.0,
+        w_reach: float = 20.0,
         w_smooth: float = 1.0,
         w_action: float = 1.0,
         huber_beta: float = 0.01
@@ -394,14 +432,17 @@ class DistanceSmoothLoss(nn.Module):
         loss_kin = (kin_diff * mask_3d).sum() / (mask_3d.sum() * 3.0 + eps)
 
         # -------------------------------------------------------------
-        # 2. Target Reach Loss: Endpoint L1 error at final valid step
+        # 2. Target Reach Loss: L1 penalty between accumulated (sum dx, sum dy)
+        #    and actual required displacement (x_tgt - x_0)
         # -------------------------------------------------------------
+        pred_disp_sum = (pred_kinematics[:, :, 0:2] * padding_masks.unsqueeze(-1)).sum(dim=1)
+        target_disp = true_target - start_pos
+        loss_reach = F.l1_loss(pred_disp_sum, target_disp, reduction='mean')
+
+        # Real screen-pixel reach error for logging (1920x1080 display standard)
         last_indices = torch.clamp(padding_masks.sum(dim=1).long() - 1, min=0, max=seq_len - 1)
         batch_indices = torch.arange(B, device=pred_traj.device)
         final_pred_pos = pred_traj[batch_indices, last_indices]
-        loss_reach = F.l1_loss(final_pred_pos, true_target, reduction='mean')
-
-        # Real screen-pixel reach error for logging (1920x1080 display)
         scale_px = torch.tensor([1920.0, 1080.0], device=pred_traj.device)
         reach_dist_px = torch.norm((final_pred_pos - true_target) * scale_px, dim=-1).mean()
 
@@ -462,11 +503,11 @@ class DistanceSmoothLoss(nn.Module):
 
 def get_scheduled_sampling_ratio(epoch: int, total_epochs: int, tf_start: float = 1.0, tf_end: float = 0.2) -> float:
     """
-    Linear decay schedule for Teacher Forcing ratio across epochs.
+    Decay schedule for Teacher Forcing ratio across epochs.
     From tf_start down to tf_end.
     """
     if total_epochs <= 1:
-        return tf_end
+        return tf_start
     progress = (epoch - 1) / (total_epochs - 1)
     return max(tf_end, tf_start - progress * (tf_start - tf_end))
 
@@ -544,14 +585,15 @@ def train_one_epoch(
         batch_size = b_start.size(0)
         optimizer.zero_grad()
 
-        # Forward pass with Scheduled Sampling
+        # Forward pass with Scheduled Sampling and padding masks
         pred_kin, pred_actions, pred_traj = model(
             start_pos=b_start,
             target_pos=b_target,
             prev_context=b_ctx,
             intent=b_intent,
             teacher_forcing_ratio=tf_ratio,
-            true_seq=b_seq
+            true_seq=b_seq,
+            padding_masks=b_mask
         )
 
         loss, metrics = criterion(
@@ -566,7 +608,7 @@ def train_one_epoch(
 
         loss.backward()
 
-        # Recurrent gradient clipping to prevent explosion
+        # Recurrent gradient clipping to prevent gradient explosion
         if clip_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
 
@@ -615,14 +657,15 @@ def evaluate(
 
         batch_size = b_start.size(0)
 
-        # Autoregressive inference: teacher_forcing_ratio = 0.0
+        # Autoregressive free-running rollout (tf_ratio = 0.0)
         pred_kin, pred_actions, pred_traj = model(
             start_pos=b_start,
             target_pos=b_target,
             prev_context=b_ctx,
             intent=b_intent,
             teacher_forcing_ratio=0.0,
-            true_seq=None
+            true_seq=None,
+            padding_masks=b_mask
         )
 
         loss, metrics = criterion(
@@ -667,6 +710,7 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden state dimension of GRU decoder")
     parser.add_argument("--cond_dim", type=int, default=64, help="Context conditioning embedding dimension")
     parser.add_argument("--noise_dim", type=int, default=16, help="Latent Gaussian stochasticity dimension")
+    parser.add_argument("--max_step_delta", type=float, default=0.05, help="Maximum physical single-step displacement")
     parser.add_argument("--tf_start", type=float, default=1.0, help="Initial Teacher Forcing ratio")
     parser.add_argument("--tf_end", type=float, default=0.2, help="Final Teacher Forcing ratio (Scheduled Sampling)")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Max gradient norm clipping threshold")
@@ -716,12 +760,13 @@ def main():
         cond_dim=args.cond_dim,
         seq_len=256,
         num_layers=2,
-        num_classes=4
+        num_classes=4,
+        max_step_delta=args.max_step_delta
     ).to(device)
 
     criterion = DistanceSmoothLoss(
         w_kin=10.0,
-        w_reach=15.0,
+        w_reach=20.0,
         w_smooth=1.0,
         w_action=1.0,
         huber_beta=0.01
@@ -805,7 +850,8 @@ def main():
                     'cond_dim': args.cond_dim,
                     'seq_len': 256,
                     'num_layers': 2,
-                    'num_classes': 4
+                    'num_classes': 4,
+                    'max_step_delta': args.max_step_delta
                 }
             }
 

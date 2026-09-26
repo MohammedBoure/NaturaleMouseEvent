@@ -6,9 +6,9 @@ An AI-powered system designed to generate biologically authentic, human-like mou
 
 - **`train_model.py`**: Production-grade PyTorch training pipeline implementing:
   - `ConditioningEncoder`: Multi-layer perceptron encoding start/target positions, 4D momentum context, binary intent, and latent Gaussian noise ($z \in \mathbb{R}^{16}$) to produce initial hidden states $h_0$ and step-wise context conditioning.
-  - `KinematicDecoder`: 2-layer GRU with continuous context injection and dual-head output (Kinematics Head for continuous $(\Delta x, \Delta y, \Delta t)$ and Action Head for 4-class discrete mouse actions).
+  - `KinematicDecoder`: 2-layer GRU with continuous context injection, bounded kinematics head (tanh-scaled displacement with $\le 0.05$ max step and sigmoid-scaled timing), and 4-class discrete action classification.
   - `DistanceSmoothLoss`: Masked multi-objective loss combining Huber kinematics loss, target reach L1 penalty, jerk/smoothness regularizer (2nd-order differences), and Cross-Entropy action classification.
-  - Scheduled Sampling: Decaying teacher forcing ratio ($1.0 \to 0.2$) over epochs to prevent autoregressive drift during test rollouts.
+  - Scheduled Sampling & Drift Stabilization: Decaying teacher forcing ratio ($1.0 \to 0.2$), screen boundary clamping, and padded-step freezing to completely eliminate autoregressive divergence during test rollouts.
 - **`human_mouse.py`**: Self-contained high-level Python API module providing the `HumanMouse` class for generating and executing natural trajectories with sub-millisecond precision timing.
 - **`execute_mouse_action.py`**: Command-line interface (CLI) to execute natural cursor movements, sequences, and dry-run simulations.
 - **`prepare_dataset.py`**: Preprocessing script converting raw SQLite recording databases into padded, normalized `.npz` tensor datasets.
