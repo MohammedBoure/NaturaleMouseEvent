@@ -26,68 +26,148 @@ except ImportError:
 # =====================================================================
 
 class ConditioningEncoder(nn.Module):
-    def __init__(self, noise_dim=4, hidden_dim=256):
+    def __init__(self, noise_dim=16, hidden_dim=256, cond_dim=64, num_layers=2):
         super(ConditioningEncoder, self).__init__()
-        in_dim = 9 + noise_dim
-        self.fc = nn.Sequential(
+        self.noise_dim = noise_dim
+        self.hidden_dim = hidden_dim
+        self.cond_dim = cond_dim
+        self.num_layers = num_layers
+
+        in_dim = 2 + 2 + 4 + 1 + noise_dim  # 9 + noise_dim
+
+        self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU()
         )
 
-    def forward(self, start_pos, target_pos, prev_context, intent, noise):
-        x = torch.cat([start_pos, target_pos, prev_context, intent, noise], dim=-1)
-        return self.fc(x)
+        self.to_h0 = nn.Linear(hidden_dim, num_layers * hidden_dim)
+        self.to_context = nn.Linear(hidden_dim, cond_dim)
+
+    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None):
+        B = start_pos.size(0)
+        if z_noise is None:
+            z_noise = torch.randn(B, self.noise_dim, device=start_pos.device, dtype=start_pos.dtype)
+
+        x = torch.cat([start_pos, target_pos, prev_context, intent, z_noise], dim=-1)
+        feat = self.mlp(x)
+
+        h0 = self.to_h0(feat).view(B, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        cond_embed = self.to_context(feat)
+
+        return h0, cond_embed
+
+
+class KinematicDecoder(nn.Module):
+    def __init__(self, hidden_dim=256, cond_dim=64, num_layers=2, num_classes=4, max_step_delta=0.08, max_dt=5.0):
+        super(KinematicDecoder, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.cond_dim = cond_dim
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.max_step_delta = max_step_delta
+        self.max_dt = max_dt
+
+        step_in_dim = 5 + cond_dim
+
+        self.gru = nn.GRU(
+            input_size=step_in_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True
+        )
+
+        self.kinematics_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 3)
+        )
+
+        self.action_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward_step(self, step_input, h):
+        gru_out, h_next = self.gru(step_input, h)
+        out_flat = gru_out.squeeze(1)
+
+        raw_kin = self.kinematics_head(out_flat)
+
+        dx = torch.tanh(raw_kin[:, 0:1]) * self.max_step_delta
+        dy = torch.tanh(raw_kin[:, 1:2]) * self.max_step_delta
+        dt = torch.sigmoid(raw_kin[:, 2:3]) * self.max_dt
+
+        kin_pred = torch.cat([dx, dy, dt], dim=-1)
+        action_logits = self.action_head(out_flat)
+
+        return kin_pred, action_logits, h_next
+
 
 class HumanMouseGenerator(nn.Module):
-    def __init__(self, noise_dim=4, hidden_dim=256, seq_len=256, out_dim=4):
+    def __init__(self, noise_dim=16, hidden_dim=256, cond_dim=64, seq_len=256, num_layers=2, num_classes=4, max_step_delta=0.08):
         super(HumanMouseGenerator, self).__init__()
         self.seq_len = seq_len
         self.noise_dim = noise_dim
         self.hidden_dim = hidden_dim
+        self.cond_dim = cond_dim
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.max_step_delta = max_step_delta
 
-        self.encoder = ConditioningEncoder(noise_dim=noise_dim, hidden_dim=hidden_dim)
-        self.gru = nn.GRU(input_size=out_dim + 4, hidden_size=hidden_dim, num_layers=2, batch_first=True)
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, out_dim)
+        self.encoder = ConditioningEncoder(
+            noise_dim=noise_dim,
+            hidden_dim=hidden_dim,
+            cond_dim=cond_dim,
+            num_layers=num_layers
         )
 
-    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None):
-        batch_size = start_pos.size(0)
-        if z_noise is None:
-            z_noise = torch.randn(batch_size, self.noise_dim, device=start_pos.device)
+        self.decoder = KinematicDecoder(
+            hidden_dim=hidden_dim,
+            cond_dim=cond_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+            max_step_delta=max_step_delta
+        )
 
-        h0 = self.encoder(start_pos, target_pos, prev_context, intent, z_noise)
-        h = h0.unsqueeze(0).repeat(2, 1, 1)
+    def forward(self, start_pos, target_pos, prev_context, intent, z_noise=None, teacher_forcing_ratio=0.0, true_seq=None, padding_masks=None):
+        B = start_pos.size(0)
+        h, cond_embed = self.encoder(start_pos, target_pos, prev_context, intent, z_noise)
 
         curr_pos = start_pos.clone()
-        step_input = torch.zeros(batch_size, 1, 8, device=start_pos.device)
-        step_input[:, 0, 4:6] = target_pos - start_pos
-        step_input[:, 0, 6:8] = start_pos
+        prev_kin = torch.zeros(B, 3, device=start_pos.device, dtype=start_pos.dtype)
 
-        outputs = []
-        cum_positions = []
+        pred_kinematics = []
+        pred_actions = []
+        pred_traj = []
 
         for t in range(self.seq_len):
-            out_gru, h = self.gru(step_input, h)
-            pred_step = self.head(out_gru.squeeze(1))
-            outputs.append(pred_step)
+            rem = torch.clamp(target_pos - curr_pos, min=-1.0, max=1.0)
+            step_feat = torch.cat([prev_kin, rem, cond_embed], dim=-1).unsqueeze(1)
 
-            dx = pred_step[:, 0:1]
-            dy = pred_step[:, 1:2]
-            curr_pos = curr_pos + torch.cat([dx, dy], dim=-1)
-            cum_positions.append(curr_pos)
+            kin_step, action_logits, h = self.decoder.forward_step(step_feat, h)
 
-            rem = target_pos - curr_pos
-            step_input = torch.cat([pred_step, rem, curr_pos], dim=-1).unsqueeze(1)
+            pred_kinematics.append(kin_step)
+            pred_actions.append(action_logits)
 
-        pred_seq = torch.stack(outputs, dim=1)
-        pred_traj = torch.stack(cum_positions, dim=1)
-        return pred_seq, pred_traj
+            next_dx_dy = kin_step[:, 0:2]
+            next_dt = kin_step[:, 2:3]
+
+            curr_pos = torch.clamp(curr_pos + next_dx_dy, min=-0.1, max=1.1)
+            prev_kin = torch.cat([next_dx_dy, next_dt], dim=-1)
+
+            pred_traj.append(curr_pos)
+
+        pred_kinematics = torch.stack(pred_kinematics, dim=1)
+        pred_actions = torch.stack(pred_actions, dim=1)
+        pred_traj = torch.stack(pred_traj, dim=1)
+
+        return pred_kinematics, pred_actions, pred_traj
+
 
 # =====================================================================
 # Trajectory Simulation Engine
@@ -99,13 +179,39 @@ class HumanMouseSimulator:
         self.display_h = float(display_h)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = HumanMouseGenerator(seq_len=256).to(self.device)
-        if os.path.exists(model_path):
-            checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Loaded trained AI mouse model from: {model_path}")
+        self.model = HumanMouseGenerator(
+            noise_dim=16,
+            hidden_dim=256,
+            cond_dim=64,
+            seq_len=256,
+            num_layers=2,
+            num_classes=4,
+            max_step_delta=0.08
+        ).to(self.device)
+
+        resolved_path = None
+        candidates = [
+            model_path,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path),
+            "human_mouse_model.pt",
+            "best_model.pth",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_mouse_model.pt"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model.pth")
+        ]
+        for p in candidates:
+            if p and os.path.exists(p):
+                resolved_path = p
+                break
+
+        if resolved_path:
+            checkpoint = torch.load(resolved_path, map_location=self.device)
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint)
+            print(f"[HumanMouse] Loaded trained AI mouse model from: {resolved_path}")
         else:
-            print(f"Warning: Model file {model_path} not found. Using untrained weights.")
+            print(f"[HumanMouse] Warning: Model file {model_path} not found. Using untrained weights.")
 
         self.model.eval()
 
@@ -125,10 +231,16 @@ class HumanMouseSimulator:
             ctx_t = torch.tensor([[prev_context[0], prev_context[1], prev_context[2], prev_context[3]]], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
-            pred_seq, pred_traj = self.model(start_t, target_t, ctx_t, intent_t)
+            pred_kin, pred_actions, pred_traj = self.model(
+                start_t, target_t, ctx_t, intent_t, teacher_forcing_ratio=0.0
+            )
 
-        pred_seq = pred_seq[0].cpu().numpy()
+        pred_kin = pred_kin[0].cpu().numpy()
+        pred_actions = pred_actions[0].cpu().numpy()
         pred_traj = pred_traj[0].cpu().numpy()
+
+        target_x, target_y = target_pos[0], target_pos[1]
+        start_x, start_y = start_pos[0], start_pos[1]
 
         trajectory = []
         trajectory.append({
@@ -138,31 +250,33 @@ class HumanMouseSimulator:
             "type": "move"
         })
 
-        target_x, target_y = target_pos[0], target_pos[1]
-        start_x, start_y = start_pos[0], start_pos[1]
-
         for step in range(len(pred_traj)):
             raw_x = pred_traj[step, 0] * self.display_w
             raw_y = pred_traj[step, 1] * self.display_h
 
-            if step < 5:
-                alpha = (step + 1) / 5.0
+            if step < 3:
+                alpha = (step + 1) / 3.0
                 x_px = (1 - alpha) * start_x + alpha * raw_x
                 y_px = (1 - alpha) * start_y + alpha * raw_y
             else:
                 x_px = raw_x
                 y_px = raw_y
 
-            dt_scaled = pred_seq[step, 2] * 100.0
-            action = pred_seq[step, 3]
+            # Clamp coordinates to screen dimensions
+            x_px = max(0, min(self.display_w - 1, x_px))
+            y_px = max(0, min(self.display_h - 1, y_px))
 
-            dt_ms = max(4.0, min(float(dt_scaled), 20.0))
+            dt_scaled = pred_kin[step, 2] * 100.0
+            dt_ms = max(4.0, min(float(dt_scaled), 40.0))
 
+            action_idx = int(np.argmax(pred_actions[step]))
             action_type = "move"
-            if action >= 0.8 and action < 1.5:
+            if action_idx == 1:
                 action_type = "click_down"
-            elif action >= 1.5 and action < 2.5:
+            elif action_idx == 2:
                 action_type = "click_up"
+            elif action_idx == 3:
+                action_type = "scroll"
 
             trajectory.append({
                 "x": int(round(x_px)),

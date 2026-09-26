@@ -52,3 +52,4 @@ Thumbs.db
 # Exceptions: Preserve trained PyTorch model weights
 !human_mouse_model.pt
 !human_mouse_engine/human_mouse_model.pt
+!best_model.pth
