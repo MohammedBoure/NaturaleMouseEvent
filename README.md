@@ -11,7 +11,8 @@ An AI-powered system designed to generate biologically authentic, human-like mou
   - Scheduled Sampling & Drift Stabilization: Decaying teacher forcing ratio ($1.0 \to 0.2$), screen boundary clamping, and padded-step freezing to completely eliminate autoregressive divergence during test rollouts.
 - **`human_mouse.py`**: Self-contained high-level Python API module providing the `HumanMouse` class for generating and executing natural trajectories with Windows 1ms multimedia timer (`timeBeginPeriod`), direct kernel cursor dispatch, AR(1) neuromuscular physiological tremor modeling, anti-stair-stepping coordinate merging, overshoot prevention, and smooth exponential decay biological easing (zero teleportation/snapping).
 - **`execute_mouse_action.py`**: Command-line interface (CLI) to execute natural cursor movements, sequences, and dry-run simulations with reach error reporting.
-- **`prepare_dataset.py`**: Preprocessing script converting raw SQLite recording databases into padded, normalized `.npz` tensor datasets.
+- **`preprocess_all_sqlite.py`**: Robust, memory-efficient data engineering pipeline that sequentially processes all SQLite telemetry databases (`data/*.sqlite3`), filters non-human / orthogonal grid artifacts, removes time anomalies, and exports unified training datasets (`data/mouse_dataset_fixed_N256_full.npz`).
+- **`prepare_dataset.py`**: Legacy preprocessor for individual session database conversions.
 - **`simulate_mouse.py`**: Offline visualizer and simulation script for evaluating model trajectories.
 - **`analyze_dur.py`**: Statistical analysis script measuring step time deltas ($\Delta t$) and episode duration distributions.
 - **`scan_dbs.py`**: Database scanner tool to inspect raw session event counts and sequence lengths across `.sqlite3` files.
