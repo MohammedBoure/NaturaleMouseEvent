@@ -112,20 +112,21 @@ current_ctx = mouse.get_context()
 
 ## 🛠️ API Reference (`HumanMouse` Class)
 
-### `HumanMouse(model_path=None, failsafe=True)`
+### `HumanMouse(model_path=None, failsafe=True, dry_run=False)`
 - **`model_path`**: Custom path to `.pt` weights file. Defaults to `human_mouse_model.pt`.
 - **`failsafe`**: Enables PyAutoGUI fail-safe protection.
+- **`dry_run`**: If `True`, simulates trajectories without moving the physical mouse.
 
 ### Main Methods
 
-- **`move_to(target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None)`**
-  Moves cursor naturally from current position to `(target_x, target_y)`.
-  Accepts optional `prev_context` tuple `(vx, vy, click_density, avg_dt)` to condition momentum.
+- **`move_to(target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None, target_radius=5.0)`**
+  Moves cursor naturally from current position to `(target_x, target_y)` with biological easing convergence.
+  Accepts optional `prev_context` tuple `(vx, vy, click_density, avg_dt)` to condition momentum, and `target_radius` tolerance.
   
-- **`click_at(target_x, target_y, button='left', delay_after=0.1, prev_context=None)`**
-  Moves cursor naturally and performs click at destination. Accepts optional `prev_context`.
+- **`click_at(target_x, target_y, button='left', delay_after=0.1, prev_context=None, target_radius=5.0)`**
+  Moves cursor naturally and performs click at destination. Accepts optional `prev_context` and `target_radius`.
 
-- **`move_sequence(target_list, click_targets=False, delay_between=0.4)`**
+- **`move_sequence(target_list, click_targets=False, delay_between=0.4, target_radius=5.0)`**
   Moves smoothly across a list of `(x, y)` targets maintaining velocity momentum context automatically across targets.
 
 - **`set_context(vx=0.0, vy=0.0, clicks=0.0, avg_dt=0.1)`**
@@ -134,8 +135,8 @@ current_ctx = mouse.get_context()
 - **`get_context()`**
   Returns the active 4D momentum context tuple `(vx, vy, clicks, avg_dt)`.
 
-- **`generate_trajectory(start_pos, target_pos, prev_context=None)`**
-  Returns a list of dict steps `[{'x': int, 'y': int, 'dt_ms': float, 'type': str}]`.
+- **`generate_trajectory(start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0)`**
+  Returns a list of dict steps `[{'x': int, 'y': int, 'dt_ms': float, 'type': str}]` with smooth biological easing and zero teleportation.
 
 ---
 

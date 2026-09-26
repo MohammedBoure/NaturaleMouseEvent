@@ -1,6 +1,7 @@
 import argparse
 import sys
 import time
+import numpy as np
 from human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -51,18 +52,15 @@ def main():
 
     # Initialize HumanMouse engine
     failsafe = not args.no_failsafe
-    mouse = HumanMouse(failsafe=failsafe)
-
-    if args.dry_run:
-        # Override pyautogui flag for dry-run
-        import human_mouse
-        human_mouse.PYAUTOGUI_AVAILABLE = False
+    mouse = HumanMouse(failsafe=failsafe, dry_run=args.dry_run)
 
     print(f"\n=======================================================")
     print(f" 🤖 AI HUMAN MOUSE ACTION EXECUTOR")
     print(f" Display Resolution: {mouse.screen_w}x{mouse.screen_h}")
     current_pos = mouse.get_current_position()
     print(f" Starting Mouse Position: {current_pos}")
+    if args.dry_run:
+        print(f" Mode: DRY-RUN (Simulation only, cursor will not move)")
     print(f"=======================================================\n")
 
     if args.sequence:
@@ -86,7 +84,10 @@ def main():
     elif args.x is not None and args.y is not None:
         target = (args.x, args.y)
         print(f"Moving to target {target} (Click={args.click})...")
-        mouse.move_to(args.x, args.y, click=args.click, delay_after=args.delay)
+        traj = mouse.move_to(args.x, args.y, click=args.click, delay_after=args.delay)
+        final_pos = (traj[-1]['x'], traj[-1]['y'])
+        dist_err = np.hypot(final_pos[0] - args.x, final_pos[1] - args.y)
+        print(f" ➔ Completed action in {len(traj)} steps (Final position: {final_pos}, Reach Error: {dist_err:.2f} px)")
         print(f" ✅ Target reached successfully!")
 
     else:

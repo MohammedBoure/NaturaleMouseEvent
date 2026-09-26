@@ -215,11 +215,37 @@ class HumanMouseSimulator:
 
         self.model.eval()
 
-    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0):
-        sx_norm = start_pos[0] / self.display_w
-        sy_norm = start_pos[1] / self.display_h
-        tx_norm = target_pos[0] / self.display_w
-        ty_norm = target_pos[1] / self.display_h
+    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0):
+        """
+        Generates realistic human mouse trajectory from start_pos to target_pos.
+        
+        Args:
+            start_pos: Tuple (x, y) in screen coordinates.
+            target_pos: Tuple (x, y) in screen coordinates.
+            prev_context: Optional 4D context tuple (vx, vy, click_density, avg_dt).
+            intent: 1.0 for targeted movement/click, 0.0 for idle wandering.
+            target_radius: Acceptable distance threshold (in px) to consider target reached.
+            
+        Returns:
+            List of dict steps: [{'x': int, 'y': int, 'dt_ms': float, 'type': str}]
+        """
+        start_x, start_y = float(start_pos[0]), float(start_pos[1])
+        target_x, target_y = float(target_pos[0]), float(target_pos[1])
+
+        # If already at destination within target tolerance, return stationary point
+        init_dist = np.hypot(target_x - start_x, target_y - start_y)
+        if init_dist <= target_radius and intent > 0.5:
+            return [{
+                "x": int(round(start_x)),
+                "y": int(round(start_y)),
+                "dt_ms": 0.0,
+                "type": "move"
+            }]
+
+        sx_norm = start_x / self.display_w
+        sy_norm = start_y / self.display_h
+        tx_norm = target_x / self.display_w
+        ty_norm = target_y / self.display_h
 
         start_t = torch.tensor([[sx_norm, sy_norm]], dtype=torch.float32, device=self.device)
         target_t = torch.tensor([[tx_norm, ty_norm]], dtype=torch.float32, device=self.device)
@@ -239,17 +265,18 @@ class HumanMouseSimulator:
         pred_actions = pred_actions[0].cpu().numpy()
         pred_traj = pred_traj[0].cpu().numpy()
 
-        target_x, target_y = target_pos[0], target_pos[1]
-        start_x, start_y = start_pos[0], start_pos[1]
-
         trajectory = []
         trajectory.append({
-            "x": int(round(start_pos[0])),
-            "y": int(round(start_pos[1])),
+            "x": int(round(start_x)),
+            "y": int(round(start_y)),
             "dt_ms": 0.0,
             "type": "move"
         })
 
+        min_dist = float('inf')
+        min_step = 0
+
+        # Step through model output
         for step in range(len(pred_traj)):
             raw_x = pred_traj[step, 0] * self.display_w
             raw_y = pred_traj[step, 1] * self.display_h
@@ -262,9 +289,9 @@ class HumanMouseSimulator:
                 x_px = raw_x
                 y_px = raw_y
 
-            # Clamp coordinates to screen dimensions
-            x_px = max(0, min(self.display_w - 1, x_px))
-            y_px = max(0, min(self.display_h - 1, y_px))
+            # Clamp coordinates to physical screen dimensions
+            x_px = max(0.0, min(self.display_w - 1.0, x_px))
+            y_px = max(0.0, min(self.display_h - 1.0, y_px))
 
             dt_scaled = pred_kin[step, 2] * 100.0
             dt_ms = max(4.0, min(float(dt_scaled), 40.0))
@@ -286,15 +313,66 @@ class HumanMouseSimulator:
             })
 
             dist_to_target = np.hypot(target_x - x_px, target_y - y_px)
-            if dist_to_target < 15.0 and step > 10:
+            if dist_to_target < min_dist:
+                min_dist = dist_to_target
+                min_step = step
+
+            # Natural stopping condition 1: reached destination within target tolerance
+            if intent > 0.5 and dist_to_target <= target_radius and step > 10:
                 break
 
-        trajectory.append({
-            "x": int(round(target_x)),
-            "y": int(round(target_y)),
-            "dt_ms": 8.0,
-            "type": "click_down"
-        })
+            # Natural stopping condition 2: overshoot detection
+            # If the model reached close proximity (<35px) and has started moving away
+            # for multiple steps, truncate at the closest approach point.
+            if intent > 0.5 and step > min_step + 8 and min_dist < 35.0 and dist_to_target > min_dist + 4.0:
+                trajectory = trajectory[:min_step + 2]
+                break
+
+        # Natural Biological Convergence (Easing Micro-Correction):
+        # If targeted movement ends slightly off-target (> target_radius), smoothly
+        # converge using an exponential decay easing curve with microscopic neuromotor jitter.
+        # NEVER perform a 1-step teleportation snap!
+        if intent > 0.5:
+            curr_x = float(trajectory[-1]["x"])
+            curr_y = float(trajectory[-1]["y"])
+            rem_dist = np.hypot(target_x - curr_x, target_y - curr_y)
+
+            if rem_dist > target_radius:
+                max_micro_steps = 35
+                for _ in range(max_micro_steps):
+                    rem_x = target_x - curr_x
+                    rem_y = target_y - curr_y
+                    d = np.hypot(rem_x, rem_y)
+                    if d <= 1.2:
+                        break
+
+                    # Biological exponential decay easing
+                    alpha = 0.32
+                    jitter_x = float(np.random.normal(0, 0.15))
+                    jitter_y = float(np.random.normal(0, 0.15))
+
+                    dx = alpha * rem_x + jitter_x
+                    dy = alpha * rem_y + jitter_y
+                    step_mag = np.hypot(dx, dy)
+
+                    # Bounded single micro-step displacement (<= 3.5 px) ensures smooth motion
+                    max_step_len = 3.5
+                    if step_mag > max_step_len:
+                        dx = (dx / step_mag) * max_step_len
+                        dy = (dy / step_mag) * max_step_len
+
+                    curr_x += dx
+                    curr_y += dy
+                    curr_x = max(0.0, min(self.display_w - 1.0, curr_x))
+                    curr_y = max(0.0, min(self.display_h - 1.0, curr_y))
+
+                    dt_ms = float(np.random.uniform(6.5, 9.5))
+                    trajectory.append({
+                        "x": int(round(curr_x)),
+                        "y": int(round(curr_y)),
+                        "dt_ms": round(dt_ms, 2),
+                        "type": "move"
+                    })
 
         return trajectory
 
@@ -307,7 +385,8 @@ class HumanMouse:
     High-level Programmatic API for natural AI human mouse movement.
     Uses trained PyTorch neural network weights to generate realistic human mouse trajectories.
     """
-    def __init__(self, model_path=None, failsafe=True):
+    def __init__(self, model_path=None, failsafe=True, dry_run=False):
+        self.dry_run = dry_run
         if model_path is None:
             # First check current working directory, then script directory
             if os.path.exists("human_mouse_model.pt"):
@@ -336,18 +415,19 @@ class HumanMouse:
             return pyautogui.position()
         return (100, 100)
 
-    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0):
+    def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0):
         """Generates AI trajectory sequence without executing physical mouse movement."""
         return self.simulator.generate_trajectory(
             start_pos=start_pos,
             target_pos=target_pos,
             prev_context=prev_context if prev_context is not None else self.prev_context,
-            intent=intent
+            intent=intent,
+            target_radius=target_radius
         )
 
     def _execute_trajectory(self, trajectory, perform_click=False, button='left'):
         """Executes generated trajectory points with high-precision timing."""
-        if not trajectory:
+        if not trajectory or self.dry_run:
             return
 
         if PYAUTOGUI_AVAILABLE:
@@ -409,14 +489,15 @@ class HumanMouse:
         """Returns current 4D context vector."""
         return self.prev_context
 
-    def move_to(self, target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None):
+    def move_to(self, target_x, target_y, click=False, button='left', delay_after=0.1, prev_context=None, target_radius=5.0):
         """
         Smoothly moves mouse from current position to (target_x, target_y) naturally using AI.
         prev_context: Optional 4D tuple (vx, vy, clicks, avg_dt) to override velocity context.
+        target_radius: Distance tolerance (px) to consider destination reached.
         """
         start_x, start_y = self.get_current_position()
         ctx = prev_context if prev_context is not None else self.prev_context
-        trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=ctx, intent=1.0)
+        trajectory = self.generate_trajectory((start_x, start_y), (target_x, target_y), prev_context=ctx, intent=1.0, target_radius=target_radius)
 
         self._execute_trajectory(trajectory, perform_click=click, button=button)
         self._update_context(trajectory)
@@ -426,9 +507,9 @@ class HumanMouse:
 
         return trajectory
 
-    def click_at(self, target_x, target_y, button='left', delay_after=0.1, prev_context=None):
+    def click_at(self, target_x, target_y, button='left', delay_after=0.1, prev_context=None, target_radius=5.0):
         """Moves mouse naturally to (target_x, target_y) and clicks."""
-        return self.move_to(target_x, target_y, click=True, button=button, delay_after=delay_after, prev_context=prev_context)
+        return self.move_to(target_x, target_y, click=True, button=button, delay_after=delay_after, prev_context=prev_context, target_radius=target_radius)
 
     def wander(self, radius=200, delay_after=0.1):
         """Generates a natural idle wandering movement around the current area without intending to click."""
@@ -445,7 +526,7 @@ class HumanMouse:
 
         return trajectory
 
-    def move_sequence(self, target_list, click_targets=False, delay_between=0.4):
+    def move_sequence(self, target_list, click_targets=False, delay_between=0.4, target_radius=5.0):
         """Moves mouse smoothly across a sequence of targets (x, y) maintaining momentum context."""
         results = []
         for i, target in enumerate(target_list):
@@ -454,7 +535,8 @@ class HumanMouse:
                 target_x,
                 target_y,
                 click=click_targets,
-                delay_after=delay_between if i < len(target_list) - 1 else 0.0
+                delay_after=delay_between if i < len(target_list) - 1 else 0.0,
+                target_radius=target_radius
             )
             results.append(traj)
         return results
