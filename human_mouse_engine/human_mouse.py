@@ -6,6 +6,25 @@ import torch
 import torch.nn as nn
 import random
 
+# Windows Real-Time Multimedia Timer & Kernel Cursor Subsystems
+WINMM_AVAILABLE = False
+USER32_AVAILABLE = False
+winmm = None
+user32 = None
+
+if os.name == 'nt':
+    import ctypes
+    try:
+        winmm = ctypes.WinDLL('winmm')
+        WINMM_AVAILABLE = True
+    except Exception:
+        winmm = None
+    try:
+        user32 = ctypes.windll.user32
+        USER32_AVAILABLE = True
+    except Exception:
+        user32 = None
+
 # Enable UTF-8 console output on Windows
 if hasattr(sys.stdout, 'reconfigure'):
     try:
@@ -276,6 +295,13 @@ class HumanMouseSimulator:
         min_dist = float('inf')
         min_step = 0
 
+        # Neuromuscular Tremor Biomechanics:
+        # Human motor execution contains 8-12 Hz physiological tremor (~0.25 - 0.40 px amplitude).
+        # Modeled as an autoregressive Ornstein-Uhlenbeck / AR(1) colored noise process.
+        tremor_x, tremor_y = 0.0, 0.0
+        rho = 0.75  # Correlation factor for ~10-12 Hz oscillation at ~120 Hz sampling
+        tremor_base_std = 0.35  # Biomechanical tremor standard deviation (px)
+
         # Step through model output
         for step in range(len(pred_traj)):
             raw_x = pred_traj[step, 0] * self.display_w
@@ -293,6 +319,21 @@ class HumanMouseSimulator:
             x_px = max(0.0, min(self.display_w - 1.0, x_px))
             y_px = max(0.0, min(self.display_h - 1.0, y_px))
 
+            dist_to_target = np.hypot(target_x - x_px, target_y - y_px)
+            if dist_to_target < min_dist:
+                min_dist = dist_to_target
+                min_step = step
+
+            # Smoothly damp tremor amplitude as cursor approaches target
+            tremor_damping = min(1.0, max(0.05, dist_to_target / 30.0))
+            eta_x = float(np.random.normal(0, tremor_base_std * tremor_damping))
+            eta_y = float(np.random.normal(0, tremor_base_std * tremor_damping))
+            tremor_x = rho * tremor_x + np.sqrt(1.0 - rho ** 2) * eta_x
+            tremor_y = rho * tremor_y + np.sqrt(1.0 - rho ** 2) * eta_y
+
+            final_x = max(0.0, min(self.display_w - 1.0, x_px + tremor_x))
+            final_y = max(0.0, min(self.display_h - 1.0, y_px + tremor_y))
+
             dt_scaled = pred_kin[step, 2] * 100.0
             dt_ms = max(4.0, min(float(dt_scaled), 40.0))
 
@@ -306,16 +347,11 @@ class HumanMouseSimulator:
                 action_type = "scroll"
 
             trajectory.append({
-                "x": int(round(x_px)),
-                "y": int(round(y_px)),
+                "x": int(round(final_x)),
+                "y": int(round(final_y)),
                 "dt_ms": round(dt_ms, 2),
                 "type": action_type
             })
-
-            dist_to_target = np.hypot(target_x - x_px, target_y - y_px)
-            if dist_to_target < min_dist:
-                min_dist = dist_to_target
-                min_step = step
 
             # Natural stopping condition 1: reached destination within target tolerance
             if intent > 0.5 and dist_to_target <= target_radius and step > 10:
@@ -374,6 +410,18 @@ class HumanMouseSimulator:
                         "type": "move"
                     })
 
+        # Micro-Freeze & Stair-Stepping Elimination:
+        # Merge consecutive identical integer coordinates to prevent zero-velocity stalls
+        if len(trajectory) > 1:
+            filtered_trajectory = [trajectory[0]]
+            for s in trajectory[1:]:
+                prev = filtered_trajectory[-1]
+                if s["x"] == prev["x"] and s["y"] == prev["y"] and s["type"] == prev["type"]:
+                    prev["dt_ms"] = round(prev["dt_ms"] + s["dt_ms"], 2)
+                else:
+                    filtered_trajectory.append(s)
+            trajectory = filtered_trajectory
+
         return trajectory
 
 # =====================================================================
@@ -387,6 +435,7 @@ class HumanMouse:
     """
     def __init__(self, model_path=None, failsafe=True, dry_run=False):
         self.dry_run = dry_run
+        self.failsafe = failsafe
         if model_path is None:
             # First check current working directory, then script directory
             if os.path.exists("human_mouse_model.pt"):
@@ -426,36 +475,65 @@ class HumanMouse:
         )
 
     def _execute_trajectory(self, trajectory, perform_click=False, button='left'):
-        """Executes generated trajectory points with high-precision timing."""
+        """Executes generated trajectory points with sub-millisecond precision timing and Windows multimedia timer."""
         if not trajectory or self.dry_run:
             return
 
-        if PYAUTOGUI_AVAILABLE:
+        # Boost Windows system timer resolution to 1ms
+        timer_boosted = False
+        if winmm is not None:
+            try:
+                winmm.timeBeginPeriod(1)
+                timer_boosted = True
+            except Exception:
+                pass
+
+        try:
             start_time = time.perf_counter()
             cumulative_target_sec = 0.0
 
             for step in trajectory:
                 dt_sec = step['dt_ms'] / 1000.0
                 cumulative_target_sec += dt_sec
+                step_target_time = start_time + cumulative_target_sec
 
+                # Sub-millisecond hybrid sleep-spinwait pacing
                 while True:
-                    elapsed = time.perf_counter() - start_time
-                    remaining = cumulative_target_sec - elapsed
-                    if remaining <= 0:
+                    rem = step_target_time - time.perf_counter()
+                    if rem <= 0.0:
                         break
-                    if remaining > 0.002:
-                        time.sleep(remaining - 0.001)
+                    # If remaining time > 2ms, sleep coarsened by 1.2ms to avoid scheduler oversleep
+                    if rem > 0.002:
+                        time.sleep(rem - 0.0012)
+                    # For final sub-millisecond fraction, spin-wait to eliminate quantum latency
 
-                x = step['x']
-                y = step['y']
+                x = int(step['x'])
+                y = int(step['y'])
+
+                # Fail-safe check: escape to screen corner (0, 0) if not starting at (0, 0)
+                if self.failsafe and (x, y) == (0, 0) and (trajectory[0]['x'], trajectory[0]['y']) != (0, 0):
+                    raise pyautogui.FailSafeException("PyAutoGUI fail-safe triggered from mouse moving to corner (0, 0)")
+
+                # Low-latency direct kernel cursor positioning on Windows, fallback to pyautogui
+                if user32 is not None:
+                    user32.SetCursorPos(x, y)
+                elif PYAUTOGUI_AVAILABLE:
+                    try:
+                        pyautogui.moveTo(x, y)
+                    except Exception:
+                        pass
+
+            if perform_click and PYAUTOGUI_AVAILABLE:
                 try:
-                    pyautogui.moveTo(x, y)
+                    pyautogui.click(button=button)
                 except Exception:
                     pass
 
-            if perform_click:
+        finally:
+            # Restore system timer resolution
+            if timer_boosted and winmm is not None:
                 try:
-                    pyautogui.click(button=button)
+                    winmm.timeEndPeriod(1)
                 except Exception:
                     pass
 
