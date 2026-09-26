@@ -16,11 +16,24 @@ An AI-powered system designed to generate biologically authentic, human-like mou
 - **`simulate_mouse.py`**: Offline visualizer and simulation script for evaluating model trajectories.
 - **`analyze_dur.py`**: Statistical analysis script measuring step time deltas ($\Delta t$) and episode duration distributions.
 - **`scan_dbs.py`**: Database scanner tool to inspect raw session event counts and sequence lengths across `.sqlite3` files.
+- **`train_pilot.py`**: Pilot training pipeline with Extended Motion History Context (Kinematic Memory):
+  - Integrates 8D inter-episode history context vector $[v_{x0}, v_{y0}, \Delta t_{\text{dwell}}, \Delta x_{\text{jump}}, \Delta y_{\text{jump}}, \text{click\_density}, \text{avg\_dt}, \|\mathbf{v}_0\|]$ to maintain biomechanical momentum continuity across sequential goals.
+  - Multi-objective `KinematicBioLoss` combining Smooth L1 kinematics, endpoint terminal reach, temporal cadence, and 3rd-derivative bio-jerk regularization ($\mathcal{L}_{\text{jerk}} = \frac{1}{T}\sum \|\Delta a_t\|^2$) to prevent sudden trajectory kinks and snaps.
+  - Built-in automated post-training trajectory sanity evaluations across short, medium, and long screen distances.
+- **`models/`**: Directory containing trained PyTorch neural network checkpoints (`pilot_mouse_model.pth`) and its [README.md](file:///D:/git/NaturaleMouseEvent/models/README.md).
 - **`data/`**: Data directory containing preprocessed trajectory datasets (`mouse_dataset_fixed_N256_full.npz`) and its [README.md](file:///D:/git/NaturaleMouseEvent/data/README.md).
 - **`human_mouse_engine/`**: Standalone packaged engine module and CLI utilities with documentation.
 
 ## Training the Model
 
+### Pilot Training with Kinematic Memory (Local Subset)
+Run the pilot training pipeline with 8D motion history context and bio-jerk regularization:
+
+```bash
+python train_pilot.py --data data/mouse_dataset_fixed_N256_full.npz --subset 6000 --epochs 6 --batch_size 64 --save_path models/pilot_mouse_model.pth
+```
+
+### Full Model Training (Production Pipeline)
 Run the training pipeline with default parameters:
 
 ```bash
