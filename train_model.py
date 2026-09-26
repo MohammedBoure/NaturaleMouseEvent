@@ -9,15 +9,20 @@ Key Architectural & Algorithmic Features:
 - Behavioral Biometrics Conditioning (Start, Target, Momentum Context, Intent, Gaussian Noise)
 - ConditioningEncoder (MLP with LayerNorm & SiLU activations)
 - KinematicDecoder (2-layer GRU with continuous context injection)
-- Bounded Kinematics Head: Tanh-bounded (dx, dy) scaling to physically realistic limits
-  and sigmoid-bounded dt to eliminate catastrophic autoregressive trajectory divergence
+- Xavier-Initialized Kinematics Head with Bounded Scaling (max_step_delta=0.08)
+  allowing realistic human burst velocities without runaway divergence
 - Action Head: 4-class discrete logits (Move, Press, Release, Scroll)
 - Dynamic Closed-Loop State Tracking: Incremental coordinate accumulation and rem_x, rem_y
   feedback with screen-boundary clamping
-- Masked Multi-Objective DistanceSmoothLoss: Kinematics Huber, Endpoint Reach L1 penalty,
-  Jerk Smoothness (2nd-order differences), and Action Cross-Entropy
-- Scheduled Sampling: Decaying Teacher Forcing ratio across epochs to bridge train-test gap
-- Padded Step Freezing: Zero displacement accumulation on padded frames beyond episode end
+- Multi-Objective DistanceSmoothLoss:
+  1) Kinematics Huber Loss on (dx, dy, dt)
+  2) Trajectory Path Alignment Loss (Smooth L1 against human intermediate waypoints)
+  3) Target Reach Loss (L1 penalty at final valid timestep)
+  4) Step-wise Directional Progress Loss (penalizing stagnation along target direction)
+  5) Low-weight Jerk Smoothness regularizer (w=0.02) allowing human ballistic motion
+  6) Action Cross-Entropy
+- Scheduled Sampling: Decaying Teacher Forcing ratio across epochs
+- Sample Episode Trajectory Tracking during Evaluation
 """
 
 import os
@@ -151,8 +156,8 @@ class ConditioningEncoder(nn.Module):
 class KinematicDecoder(nn.Module):
     """
     2-Layer GRU Kinematic Decoder with Dual-Head Output:
-    - Kinematics Head: Outputs (dx, dy, dt) strictly bounded via tanh and sigmoid
-      to prevent catastrophic autoregressive displacement runaway.
+    - Kinematics Head: Outputs (dx, dy, dt) initialized with Xavier uniform
+      and bounded via tanh and sigmoid to allow human burst velocities without runaway divergence.
     - Action Head: Outputs raw logits for 4 discrete action classes.
     """
     def __init__(
@@ -161,7 +166,7 @@ class KinematicDecoder(nn.Module):
         cond_dim: int = 64,
         num_layers: int = 2,
         num_classes: int = 4,
-        max_step_delta: float = 0.05,
+        max_step_delta: float = 0.08,
         max_dt: float = 5.0
     ):
         super().__init__()
@@ -189,8 +194,8 @@ class KinematicDecoder(nn.Module):
             nn.Linear(64, 3)
         )
 
-        # Gentle weight initialization so initial step predictions begin close to resting velocity
-        nn.init.uniform_(self.kinematics_head[-1].weight, -1e-3, 1e-3)
+        # Standard Xavier/Glorot uniform initialization to avoid lazy zero-movement local minima
+        nn.init.xavier_uniform_(self.kinematics_head[-1].weight)
         nn.init.zeros_(self.kinematics_head[-1].bias)
 
         # Action Head: outputs logits for 4 discrete actions (Move, Press, Release, Scroll)
@@ -215,11 +220,9 @@ class KinematicDecoder(nn.Module):
 
         raw_kin = self.kinematics_head(out_flat)
 
-        # -------------------------------------------------------------
         # Physical Output Bounding:
-        # dx, dy: Tanh activation scaled to max_step_delta (~0.05 normalized screen units)
+        # dx, dy: Tanh activation scaled to max_step_delta (~0.08 normalized screen units)
         # dt: Sigmoid activation scaled to max_dt (~5.0, i.e., 500ms max)
-        # -------------------------------------------------------------
         dx = torch.tanh(raw_kin[:, 0:1]) * self.max_step_delta
         dy = torch.tanh(raw_kin[:, 1:2]) * self.max_step_delta
         dt = torch.sigmoid(raw_kin[:, 2:3]) * self.max_dt
@@ -247,7 +250,7 @@ class HumanMouseGenerator(nn.Module):
         seq_len: int = 256,
         num_layers: int = 2,
         num_classes: int = 4,
-        max_step_delta: float = 0.05
+        max_step_delta: float = 0.08
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -310,7 +313,6 @@ class HumanMouseGenerator(nn.Module):
 
         pred_kinematics = []
         pred_actions = []
-        pred_traj = []
 
         use_tf = (teacher_forcing_ratio > 0.0 and true_seq is not None and self.training)
 
@@ -345,11 +347,17 @@ class HumanMouseGenerator(nn.Module):
             curr_pos = torch.clamp(curr_pos + disp_update, min=-0.1, max=1.1)
             prev_kin = torch.cat([next_dx_dy * step_mask, next_dt], dim=-1)
 
-            pred_traj.append(curr_pos)
-
         pred_kinematics = torch.stack(pred_kinematics, dim=1) # (B, seq_len, 3)
         pred_actions = torch.stack(pred_actions, dim=1)       # (B, seq_len, 4)
-        pred_traj = torch.stack(pred_traj, dim=1)             # (B, seq_len, 2)
+
+        # Reconstruct full cumulative predicted trajectory from model's predicted displacements
+        # Gradients from trajectory & reach losses flow directly through cumsum into pred_kinematics
+        if padding_masks is not None:
+            valid_pred_disp = pred_kinematics[:, :, 0:2] * padding_masks.unsqueeze(-1)
+        else:
+            valid_pred_disp = pred_kinematics[:, :, 0:2]
+
+        pred_traj = start_pos.unsqueeze(1) + torch.cumsum(valid_pred_disp, dim=1)
 
         return pred_kinematics, pred_actions, pred_traj
 
@@ -387,25 +395,30 @@ class HumanMouseGenerator(nn.Module):
 
 class DistanceSmoothLoss(nn.Module):
     """
-    Masked Multi-Task Kinematic Trajectory Loss:
+    Active Masked Multi-Task Kinematic Trajectory Loss:
     - Kinematics Loss: Masked Huber (Smooth L1) loss on (dx, dy, dt).
-    - Target Reach Loss: L1 penalty between accumulated (sum dx, sum dy) and the actual (x_tgt - x_0)
-      at the final valid timestep.
-    - Jerk / Smoothness Penalty: Penalize 2nd-order differences of step displacements (acceleration variation).
+    - Trajectory Path Loss (w=15.0): Intermediate position tracking along human trajectory path.
+    - Target Reach Loss (w=25.0): L1 penalty at final valid timestep.
+    - Directional Progress Loss (w=5.0): Penalize stagnation/backward motion along target vector.
+    - Jerk / Smoothness Penalty (w=0.02): Low weight regularizer to avoid penalizing human ballistic motion.
     - Action Classification Loss: Masked Cross-Entropy for 4-class discrete actions.
     - Masking: Padded steps (padding_mask == 0) have strictly zero contribution to all losses.
     """
     def __init__(
         self,
-        w_kin: float = 10.0,
-        w_reach: float = 20.0,
-        w_smooth: float = 1.0,
+        w_kin: float = 5.0,
+        w_traj: float = 15.0,
+        w_reach: float = 25.0,
+        w_progress: float = 5.0,
+        w_smooth: float = 0.02,
         w_action: float = 1.0,
         huber_beta: float = 0.01
     ):
         super().__init__()
         self.w_kin = w_kin
+        self.w_traj = w_traj
         self.w_reach = w_reach
+        self.w_progress = w_progress
         self.w_smooth = w_smooth
         self.w_action = w_action
         self.huber_beta = huber_beta
@@ -432,33 +445,51 @@ class DistanceSmoothLoss(nn.Module):
         loss_kin = (kin_diff * mask_3d).sum() / (mask_3d.sum() * 3.0 + eps)
 
         # -------------------------------------------------------------
-        # 2. Target Reach Loss: L1 penalty between accumulated (sum dx, sum dy)
-        #    and actual required displacement (x_tgt - x_0)
+        # 2. Trajectory Path Loss: Intermediate position tracking
         # -------------------------------------------------------------
-        pred_disp_sum = (pred_kinematics[:, :, 0:2] * padding_masks.unsqueeze(-1)).sum(dim=1)
-        target_disp = true_target - start_pos
-        loss_reach = F.l1_loss(pred_disp_sum, target_disp, reduction='mean')
+        true_traj = start_pos.unsqueeze(1) + torch.cumsum(true_seq[:, :, 0:2] * mask_3d, dim=1)
+        traj_diff = F.smooth_l1_loss(pred_traj, true_traj, reduction='none', beta=self.huber_beta).sum(dim=-1)
+        loss_traj = (traj_diff * padding_masks).sum() / (padding_masks.sum() + eps)
 
-        # Real screen-pixel reach error for logging (1920x1080 display standard)
+        # -------------------------------------------------------------
+        # 3. Target Reach Loss: Endpoint L1 error at final valid step
+        # -------------------------------------------------------------
         last_indices = torch.clamp(padding_masks.sum(dim=1).long() - 1, min=0, max=seq_len - 1)
         batch_indices = torch.arange(B, device=pred_traj.device)
         final_pred_pos = pred_traj[batch_indices, last_indices]
+        loss_reach = F.l1_loss(final_pred_pos, true_target, reduction='mean')
+
+        # Real screen-pixel reach error for logging (1920x1080 display standard)
         scale_px = torch.tensor([1920.0, 1080.0], device=pred_traj.device)
         reach_dist_px = torch.norm((final_pred_pos - true_target) * scale_px, dim=-1).mean()
 
         # -------------------------------------------------------------
-        # 3. Jerk / Smoothness Penalty: 2nd differences of displacements
+        # 4. Directional Progress Loss: Penalize stagnation along target direction
+        # -------------------------------------------------------------
+        target_vec = true_target.unsqueeze(1) - pred_traj # (B, seq_len, 2)
+        target_dist = torch.norm(target_vec, dim=-1, keepdim=True) + 1e-6
+        target_unit_dir = target_vec / target_dist
+
+        step_disp = pred_kinematics[:, :, 0:2]
+        progress_along_target = (step_disp * target_unit_dir).sum(dim=-1) # (B, seq_len)
+
+        # Penalize lack of positive movement towards target when still outside arrival radius
+        active_progress_mask = padding_masks * (target_dist.squeeze(-1) > 0.015).float()
+        progress_penalty = F.relu(0.001 - progress_along_target)
+        loss_progress = (progress_penalty * active_progress_mask).sum() / (active_progress_mask.sum() + eps)
+
+        # -------------------------------------------------------------
+        # 5. Jerk / Smoothness Penalty (Low weight 0.02)
         # -------------------------------------------------------------
         dx_dy = pred_kinematics[:, :, 0:2]
         accel = dx_dy[:, 1:, :] - dx_dy[:, :-1, :]
         jerk = accel[:, 1:, :] - accel[:, :-1, :]
 
-        # Valid mask for 3 consecutive steps: t, t+1, t+2
         jerk_mask = (padding_masks[:, 2:] * padding_masks[:, 1:-1] * padding_masks[:, :-2]).unsqueeze(-1)
         loss_smooth = (torch.square(jerk) * jerk_mask).sum() / (jerk_mask.sum() * 2.0 + eps)
 
         # -------------------------------------------------------------
-        # 4. Action Classification Loss: Masked Cross-Entropy
+        # 6. Action Classification Loss: Masked Cross-Entropy
         # -------------------------------------------------------------
         true_actions = true_seq[:, :, 5].long()
         ce_loss_raw = F.cross_entropy(
@@ -476,17 +507,21 @@ class DistanceSmoothLoss(nn.Module):
         # Kinematic Displacement MSE
         mse_kin = (torch.square(pred_kinematics[:, :, 0:2] - true_kin[:, :, 0:2]).sum(dim=-1) * padding_masks).sum() / (padding_masks.sum() * 2.0 + eps)
 
-        # Total Weighted Loss
+        # Total Weighted Multi-Task Loss
         total_loss = (
             self.w_kin * loss_kin +
+            self.w_traj * loss_traj +
             self.w_reach * loss_reach +
+            self.w_progress * loss_progress +
             self.w_smooth * loss_smooth +
             self.w_action * loss_action
         )
 
         metrics = {
             'loss_kin': loss_kin.item(),
+            'loss_traj': loss_traj.item(),
             'loss_reach': loss_reach.item(),
+            'loss_progress': loss_progress.item(),
             'loss_smooth': loss_smooth.item(),
             'loss_action': loss_action.item(),
             'reach_error_px': reach_dist_px.item(),
@@ -565,7 +600,9 @@ def train_one_epoch(
     total_loss = 0.0
     accumulated_metrics = {
         'loss_kin': 0.0,
+        'loss_traj': 0.0,
         'loss_reach': 0.0,
+        'loss_progress': 0.0,
         'loss_smooth': 0.0,
         'loss_action': 0.0,
         'reach_error_px': 0.0,
@@ -629,16 +666,20 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     criterion: nn.Module,
-    device: torch.device
+    device: torch.device,
+    print_sample: bool = False
 ) -> Tuple[float, Dict[str, float]]:
     """
     Evaluates model performance under pure autoregressive rollout (tf_ratio = 0.0).
+    Optionally prints sample episode trajectory coordinates to verify active physical movement.
     """
     model.eval()
     total_loss = 0.0
     accumulated_metrics = {
         'loss_kin': 0.0,
+        'loss_traj': 0.0,
         'loss_reach': 0.0,
+        'loss_progress': 0.0,
         'loss_smooth': 0.0,
         'loss_action': 0.0,
         'reach_error_px': 0.0,
@@ -646,6 +687,7 @@ def evaluate(
         'mse_kin': 0.0
     }
     total_samples = 0
+    sample_logged = None
 
     for b_start, b_target, b_ctx, b_intent, b_seq, b_mask in loader:
         b_start = b_start.to(device)
@@ -683,6 +725,22 @@ def evaluate(
             accumulated_metrics[k] += metrics[k] * batch_size
         total_samples += batch_size
 
+        # Record first sample episode coordinates for verification
+        if print_sample and sample_logged is None:
+            s_px = (b_start[0] * torch.tensor([1920.0, 1080.0], device=device)).cpu().numpy()
+            t_px = (b_target[0] * torch.tensor([1920.0, 1080.0], device=device)).cpu().numpy()
+            last_idx = int(b_mask[0].sum().item()) - 1
+            f_px = (pred_traj[0, last_idx] * torch.tensor([1920.0, 1080.0], device=device)).cpu().numpy()
+            d_init = np.linalg.norm(t_px - s_px)
+            d_final = np.linalg.norm(t_px - f_px)
+            d_traversed = np.linalg.norm(f_px - s_px)
+            sample_logged = (s_px, t_px, f_px, d_init, d_final, d_traversed)
+
+    if sample_logged is not None:
+        s_px, t_px, f_px, d_init, d_final, d_traversed = sample_logged
+        print(f"\n   [Sample Eval Track] Start: ({s_px[0]:.1f}, {s_px[1]:.1f}) -> Target: ({t_px[0]:.1f}, {t_px[1]:.1f}) -> Final: ({f_px[0]:.1f}, {f_px[1]:.1f})")
+        print(f"                       Start-to-Target: {d_init:.1f} px | Final Reach Error: {d_final:.1f} px | Traversed: {d_traversed:.1f} px")
+
     avg_loss = total_loss / total_samples
     avg_metrics = {k: accumulated_metrics[k] / total_samples for k in accumulated_metrics}
     return avg_loss, avg_metrics
@@ -710,9 +768,9 @@ def main():
     parser.add_argument("--hidden_dim", type=int, default=256, help="Hidden state dimension of GRU decoder")
     parser.add_argument("--cond_dim", type=int, default=64, help="Context conditioning embedding dimension")
     parser.add_argument("--noise_dim", type=int, default=16, help="Latent Gaussian stochasticity dimension")
-    parser.add_argument("--max_step_delta", type=float, default=0.05, help="Maximum physical single-step displacement")
+    parser.add_argument("--max_step_delta", type=float, default=0.08, help="Maximum physical single-step displacement")
     parser.add_argument("--tf_start", type=float, default=1.0, help="Initial Teacher Forcing ratio")
-    parser.add_argument("--tf_end", type=float, default=0.2, help="Final Teacher Forcing ratio (Scheduled Sampling)")
+    parser.add_argument("--tf_end", type=float, default=0.1, help="Final Teacher Forcing ratio (Scheduled Sampling)")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Max gradient norm clipping threshold")
     parser.add_argument("--val_split", type=float, default=0.2, help="Validation dataset split ratio")
     parser.add_argument("--save_path", type=str, default="best_model.pth", help="Filepath for saving the best model checkpoint")
@@ -765,9 +823,11 @@ def main():
     ).to(device)
 
     criterion = DistanceSmoothLoss(
-        w_kin=10.0,
-        w_reach=20.0,
-        w_smooth=1.0,
+        w_kin=5.0,
+        w_traj=15.0,
+        w_reach=25.0,
+        w_progress=5.0,
+        w_smooth=0.02,
         w_action=1.0,
         huber_beta=0.01
     ).to(device)
@@ -813,7 +873,8 @@ def main():
             model=model,
             loader=val_loader,
             criterion=criterion,
-            device=device
+            device=device,
+            print_sample=True
         )
 
         scheduler.step()
