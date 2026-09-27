@@ -258,8 +258,11 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     actual_b = (float(traj1[-1]['x']), float(traj1[-1]['y']))
     traj2 = mouse.generate_trajectory(actual_b, pt_c, prev_context=arr_momentum, intent=1.0)
 
-    # Combine trajectories
-    combined_traj = traj1 + traj2[1:]
+    # Combine trajectories and apply global biomechanical safety filter across concatenated multi-segment path
+    combined_raw = traj1 + traj2[1:]
+    combined_traj = mouse.apply_biomechanical_kinematic_filter(
+        combined_raw, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0
+    )
 
     xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float32)
     ys = np.array([pt['y'] for pt in combined_traj], dtype=np.float32)
@@ -278,7 +281,7 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     accelerations = np.zeros_like(velocities_px_per_s)
     if len(velocities_px_per_s) > 1:
         dv = np.diff(velocities_px_per_s)
-        dt_acc = dt_mid[1:]
+        dt_acc = 0.5 * (dt_mid[:-1] + dt_mid[1:])
         valid_acc = dt_acc > 1e-3
         accelerations[1:][valid_acc] = dv[valid_acc] / (dt_acc[valid_acc] / 1000.0)
 

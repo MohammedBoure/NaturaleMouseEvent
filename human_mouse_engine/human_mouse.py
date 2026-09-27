@@ -407,7 +407,7 @@ class HumanMouseSimulator:
                 min_step = step
 
             dt_scaled = float(pred_kin[step, 2]) * 100.0
-            dt_ms = max(5.0, min(dt_scaled, 35.0))
+            dt_ms = max(7.0, min(dt_scaled, 35.0))
             dt_sec = dt_ms / 1000.0
 
             # Instantaneous speed for biomechanical tremor suppression
@@ -446,9 +446,14 @@ class HumanMouseSimulator:
             if intent > 0.5 and dist_to_target <= target_radius and step > 10:
                 break
 
-            # Natural stopping condition 2: overshoot detection
-            if intent > 0.5 and step > min_step + 8 and min_dist < 30.0 and dist_to_target > min_dist + 5.0:
-                trajectory = trajectory[:min_step + 2]
+            # Natural stopping condition 2: overshoot or loitering near target
+            if intent > 0.5 and step > min_step + 4 and min_dist < 30.0:
+                if dist_to_target > min_dist + 3.0 or cur_speed_px_s < 120.0:
+                    trajectory = trajectory[:min_step + 1]
+                    break
+
+            # Natural stopping condition 3: terminal deceleration near target (eliminates dead idle zone)
+            if intent > 0.5 and step > 25 and dist_to_target < 28.0 and cur_speed_px_s < 80.0:
                 break
 
         # Asymptotic Deceleration & Target Settlement:
@@ -537,13 +542,85 @@ class HumanMouse:
 
     def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0):
         """Generates AI trajectory sequence without executing physical mouse movement."""
-        return self.simulator.generate_trajectory(
+        raw_traj = self.simulator.generate_trajectory(
             start_pos=start_pos,
             target_pos=target_pos,
             prev_context=prev_context if prev_context is not None else self.prev_context,
             intent=intent,
             target_radius=target_radius
         )
+        return self.apply_biomechanical_kinematic_filter(raw_traj)
+
+    @staticmethod
+    def apply_biomechanical_kinematic_filter(trajectory, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0):
+        """
+        Global Biomechanical Safety Filter.
+        Enforces strict physical constraints across single or multi-segment paths:
+          1. Strict lower-bound on delta time: dt >= 7.0 ms (125-142 Hz hardware polling).
+          2. Absolute velocity ceiling: v <= 2200.0 px/s.
+          3. Absolute acceleration limit: |a| <= 35,000.0 px/s^2.
+          4. Forward-backward velocity profiling and minimum-jerk shock absorption.
+        """
+        if not trajectory or len(trajectory) < 3:
+            return trajectory
+
+        out = [dict(p) for p in trajectory]
+        N = len(out)
+
+        # 1. Enforce strict hardware polling lower bound
+        for i in range(1, N):
+            out[i]['dt_ms'] = max(min_dt_ms, float(out[i]['dt_ms']))
+
+        # 2. Extract discrete positions and displacements
+        xs = np.array([p['x'] for p in out], dtype=np.float64)
+        ys = np.array([p['y'] for p in out], dtype=np.float64)
+        dists = np.hypot(np.diff(xs), np.diff(ys))  # length N-1
+
+        # 3. Dynamic Forward-Backward Velocity & Acceleration Profiling
+        dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / max_velocity)
+        v_profile = dists / dt_clamped
+        effective_a_max = max_acceleration * 0.90
+
+        for i in range(len(v_profile)):
+            if dists[i] < 0.1:
+                v_profile[i] = 0.0
+
+        # Forward pass: v[i] <= v[i-1] + a_max * dt
+        for i in range(1, len(v_profile)):
+            dt_step = dt_clamped[i]
+            if v_profile[i-1] == 0.0 and v_profile[i] > 0.0:
+                min_dt_launch = math.sqrt(dists[i] / effective_a_max)
+                dt_clamped[i] = max(dt_clamped[i], min_dt_launch)
+                v_profile[i] = dists[i] / dt_clamped[i]
+            else:
+                max_allowed_v = v_profile[i-1] + effective_a_max * dt_step
+                if v_profile[i] > max_allowed_v:
+                    v_profile[i] = max_allowed_v
+                    if v_profile[i] > 1e-4:
+                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_profile[i])
+
+        # Backward pass: v[i] <= v[i+1] + a_max * dt
+        for i in range(len(v_profile) - 2, -1, -1):
+            dt_step = dt_clamped[i]
+            if v_profile[i+1] == 0.0 and v_profile[i] > 0.0:
+                min_dt_stop = math.sqrt(dists[i] / effective_a_max)
+                dt_clamped[i] = max(dt_clamped[i], min_dt_stop)
+                v_profile[i] = dists[i] / dt_clamped[i]
+            else:
+                max_allowed_v = v_profile[i+1] + effective_a_max * dt_step
+                if v_profile[i] > max_allowed_v:
+                    v_profile[i] = max_allowed_v
+                    if v_profile[i] > 1e-4:
+                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_profile[i])
+
+        # Re-apply updated dt_ms
+        for i in range(1, N):
+            if dists[i-1] > 0.1:
+                out[i]['dt_ms'] = round(dt_clamped[i-1] * 1000.0, 2)
+            else:
+                out[i]['dt_ms'] = max(min_dt_ms, out[i]['dt_ms'])
+
+        return out
 
     def _execute_trajectory(self, trajectory, perform_click=False, button='left'):
         """Executes generated trajectory points with sub-millisecond precision timing and Windows multimedia timer."""
@@ -608,29 +685,67 @@ class HumanMouse:
                 except Exception:
                     pass
 
-    def compute_terminal_momentum(self, trajectory, dwell_time_sec=0.1, jump_offset=(0.0, 0.0)):
+    def compute_terminal_momentum(self, trajectory, dwell_time_sec=0.08, jump_offset=(0.0, 0.0)):
         """
         Computes the residual arrival velocity vector (vx, vy) and builds the full
         kinematic memory context vector for smooth momentum chaining across waypoints.
+        Enforces strict physiological limits (v <= 1800 px/s), normalized coordinates,
+        and exponential dwell time dissipation (tau = 0.08s).
         """
         if not trajectory or len(trajectory) < 2:
             if getattr(self.simulator, 'context_dim', 8) == 8:
                 return (0.0, 0.0, float(dwell_time_sec), 0.0, 0.0, 0.0, 0.1, 0.0)
             return (0.0, 0.0, 0.0, 0.1)
 
-        # Look at the final 6 to 10 points before any micro-easing to capture arrival velocity
-        k = min(10, len(trajectory) - 1)
-        dx_px = float(trajectory[-1]['x'] - trajectory[-k]['x'])
-        dy_px = float(trajectory[-1]['y'] - trajectory[-k]['y'])
-        dt_sum_sec = float(sum(trajectory[j]['dt_ms'] for j in range(len(trajectory) - k, len(trajectory))) / 1000.0)
+        # 1. Identify arrival velocity from moving steps prior to terminal rest
+        k = min(12, len(trajectory) - 1)
+        tail = trajectory[-k:]
+        moving_steps = [s for s in tail if s.get('dt_ms', 0) > 0]
 
-        if dt_sum_sec > 1e-4:
-            vx_final = (dx_px / self.screen_w) / dt_sum_sec
-            vy_final = (dy_px / self.screen_h) / dt_sum_sec
+        if len(moving_steps) >= 2:
+            dx_px = float(moving_steps[-1]['x'] - moving_steps[0]['x'])
+            dy_px = float(moving_steps[-1]['y'] - moving_steps[0]['y'])
+            dt_sum_sec = float(sum(s['dt_ms'] for s in moving_steps[1:]) / 1000.0)
+            if dt_sum_sec > 1e-4:
+                vx_px_s = dx_px / dt_sum_sec
+                vy_px_s = dy_px / dt_sum_sec
+            else:
+                vx_px_s, vy_px_s = 0.0, 0.0
         else:
-            vx_final, vy_final = 0.0, 0.0
+            vx_px_s, vy_px_s = 0.0, 0.0
 
-        momentum_mag = float(np.hypot(vx_final, vy_final))
+        # 2. Cap to realistic physiological bounds (v_max_human ~ 1800 px/s)
+        v_mag_px_s = float(np.hypot(vx_px_s, vy_px_s))
+        if v_mag_px_s > 1800.0:
+            scale_cap = 1800.0 / v_mag_px_s
+            vx_px_s *= scale_cap
+            vy_px_s *= scale_cap
+            v_mag_px_s = 1800.0
+
+        # 3. Exponential dwell dissipation: v_inflow = v_terminal * exp(-dwell / tau_decay)
+        tau_decay = 0.08  # 80ms decay constant
+        dwell_s = max(0.0, float(dwell_time_sec))
+        decay_factor = math.exp(-dwell_s / tau_decay)
+
+        # If pause/dwell exceeds 50ms or speed is negligible, dissipate to complete rest
+        if dwell_s > 0.05 or (v_mag_px_s * decay_factor) < 15.0:
+            vx_inflow = 0.0
+            vy_inflow = 0.0
+        else:
+            vx_inflow = vx_px_s * decay_factor
+            vy_inflow = vy_px_s * decay_factor
+
+        # 4. Strict screen normalization (W, H)
+        vx_final = float(vx_inflow / self.screen_w)
+        vy_final = float(vy_inflow / self.screen_h)
+        norm_mag = float(np.hypot(vx_final, vy_final))
+
+        # Clamp normalized magnitude to <= 1.0
+        if norm_mag > 1.0:
+            vx_final /= norm_mag
+            vy_final /= norm_mag
+            norm_mag = 1.0
+
         clicks = float(sum(1 for step in trajectory if step['type'] in ['click_down', 'click_up']) / 256.0)
         avg_dt = float((sum(step['dt_ms'] for step in trajectory) / len(trajectory)) / 100.0)
         scaled_dwell = max(0.01, min(1.0, float(dwell_time_sec)))
@@ -644,7 +759,7 @@ class HumanMouse:
                 float(jump_offset[1] / self.screen_h),
                 float(clicks),
                 float(avg_dt),
-                float(momentum_mag)
+                float(norm_mag)
             )
         else:
             return (float(vx_final), float(vy_final), float(clicks), float(avg_dt))
