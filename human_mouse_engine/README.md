@@ -2,7 +2,7 @@
 
 An AI-powered natural human mouse trajectory generation and execution engine built with **PyTorch** and **PyAutoGUI**. 
 
-This package generates realistic, human-like mouse movements using a trained neural network (`human_mouse_model.pt`). It eliminates robotic straight-line cursor movements by introducing natural micro-variations, acceleration/deceleration curves, curved paths, continuous velocity momentum context, 8-12 Hz neuromuscular physiological tremor, and a Windows 1ms multimedia timer loop with sub-millisecond execution precision.
+This package generates realistic, human-like mouse movements using a trained neural network (`human_mouse_model.pt`). It eliminates robotic straight-line cursor movements by introducing natural micro-variations, acceleration/deceleration curves, curved paths, continuous velocity momentum context, continuous Savitzky-Golay coordinate smoothing, hyperbolic tangent soft velocity saturation, 8-12 Hz neuromuscular physiological tremor, and a Windows 1ms multimedia timer loop with sub-millisecond execution precision.
 
 ---
 

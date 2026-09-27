@@ -7,7 +7,11 @@ import torch
 import torch.nn as nn
 import random
 
-# Windows Real-Time Multimedia Timer & Kernel Cursor Subsystems
+try:
+    from scipy.signal import savgol_filter
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 WINMM_AVAILABLE = False
 USER32_AVAILABLE = False
 winmm = None
@@ -376,8 +380,8 @@ class HumanMouseSimulator:
 
         trajectory = []
         trajectory.append({
-            "x": int(round(start_x)),
-            "y": int(round(start_y)),
+            "x": float(start_x),
+            "y": float(start_y),
             "dt_ms": 0.0,
             "type": "move"
         })
@@ -436,8 +440,8 @@ class HumanMouseSimulator:
                 action_type = "scroll"
 
             trajectory.append({
-                "x": int(round(final_x)),
-                "y": int(round(final_y)),
+                "x": float(final_x),
+                "y": float(final_y),
                 "dt_ms": round(dt_ms, 2),
                 "type": action_type
             })
@@ -458,52 +462,74 @@ class HumanMouseSimulator:
 
         # Asymptotic Deceleration & Target Settlement:
         # Eliminates the artificial constant-velocity floor/plateau.
-        # If the model ends within <2.0px, it settles cleanly to v=0.
-        # If corrective submovement is needed (>2.0px), execute a biological
-        # Flash & Hogan (1985) Minimum-Jerk polynomial whose velocity decays to exactly 0.0 px/s.
+        # Decelerates smoothly from incoming velocity to exactly 0.0 px/s at the target.
         if intent > 0.5 and len(trajectory) > 0:
             last_pt = trajectory[-1]
             rem_x = target_x - float(last_pt["x"])
             rem_y = target_y - float(last_pt["y"])
             rem_dist = float(np.hypot(rem_x, rem_y))
 
-            if rem_dist > 2.0:
-                num_sub_steps = min(14, max(8, int(rem_dist * 1.5)))
+            if rem_dist > 1.0:
+                # Estimate incoming velocity from preceding steps
+                if len(trajectory) >= 3:
+                    prev_pt = trajectory[-2]
+                    dt_last = max(7.0, float(last_pt.get("dt_ms", 10.0))) / 1000.0
+                    v_in = float(np.hypot(last_pt["x"] - prev_pt["x"], last_pt["y"] - prev_pt["y"])) / dt_last
+                else:
+                    v_in = 60.0
+
+                v0 = max(25.0, min(150.0, v_in))
+                T_dec = max(0.08, min(0.18, 0.5 * rem_dist / v0))
+                D_dec = 0.5 * v0 * T_dec
+
+                if rem_dist > D_dec:
+                    D_coast = rem_dist - D_dec
+                    T_coast = D_coast / v0
+                    T_total = max(0.10, min(0.45, T_coast + T_dec))
+                else:
+                    D_coast = 0.0
+                    T_coast = 0.0
+                    T_total = max(0.08, 2.0 * rem_dist / v0)
+                    T_dec = T_total
+                    D_dec = rem_dist
+
+                target_dt_ms = 8.5
+                num_sub_steps = max(6, int(round((T_total * 1000.0) / target_dt_ms)))
+                actual_dt_sec = T_total / float(num_sub_steps)
+                sub_dt_ms = actual_dt_sec * 1000.0
+
                 p0_x, p0_y = float(last_pt["x"]), float(last_pt["y"])
+                f_c = min(0.70, D_coast / max(1e-4, rem_dist)) if rem_dist > D_dec else 0.0
 
                 for step_k in range(1, num_sub_steps + 1):
                     tau = step_k / float(num_sub_steps)
-                    # Quintic polynomial: zero velocity and acceleration at tau=0 and tau=1
-                    poly = 10.0 * (tau ** 3) - 15.0 * (tau ** 4) + 6.0 * (tau ** 5)
-                    curr_sub_x = p0_x + rem_x * poly
-                    curr_sub_y = p0_y + rem_y * poly
-                    sub_dt_ms = 10.0 + 8.0 * math.sin(math.pi * tau)
+                    if step_k == num_sub_steps:
+                        curr_sub_x = float(target_x)
+                        curr_sub_y = float(target_y)
+                    else:
+                        if tau <= f_c and f_c > 0.0:
+                            frac = tau
+                        else:
+                            sig = (tau - f_c) / max(1e-4, 1.0 - f_c)
+                            frac = f_c + (1.0 - f_c) * (1.0 - (1.0 - sig) ** 2)
+
+                        frac = max(0.0, min(1.0, frac))
+                        curr_sub_x = p0_x + rem_x * frac
+                        curr_sub_y = p0_y + rem_y * frac
+
                     trajectory.append({
-                        "x": int(round(curr_sub_x)),
-                        "y": int(round(curr_sub_y)),
+                        "x": float(curr_sub_x),
+                        "y": float(curr_sub_y),
                         "dt_ms": round(sub_dt_ms, 2),
                         "type": "move"
                     })
-
-        # Anti-Stair-Stepping & Redundant Step Compression
-        if len(trajectory) > 1:
-            filtered_trajectory = [trajectory[0]]
-            for s in trajectory[1:]:
-                prev = filtered_trajectory[-1]
-                if s["x"] == prev["x"] and s["y"] == prev["y"] and s["type"] == prev["type"]:
-                    prev["dt_ms"] = round(prev["dt_ms"] + s["dt_ms"], 2)
-                else:
-                    filtered_trajectory.append(s)
-
-            # Ensure biological resting state at the target coordinate (v = 0.0 px/s)
-            if intent > 0.5:
-                filtered_trajectory.append({
-                    "x": int(round(target_x)),
-                    "y": int(round(target_y)),
-                    "dt_ms": 15.0,
+            else:
+                trajectory.append({
+                    "x": float(target_x),
+                    "y": float(target_y),
+                    "dt_ms": 10.0,
                     "type": "move"
                 })
-            trajectory = filtered_trajectory
 
         return trajectory
 
@@ -552,14 +578,15 @@ class HumanMouse:
         return self.apply_biomechanical_kinematic_filter(raw_traj)
 
     @staticmethod
-    def apply_biomechanical_kinematic_filter(trajectory, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0):
+    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=1700.0, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0):
         """
         Global Biomechanical Safety Filter.
-        Enforces strict physical constraints across single or multi-segment paths:
-          1. Strict lower-bound on delta time: dt >= 7.0 ms (125-142 Hz hardware polling).
-          2. Absolute velocity ceiling: v <= 2200.0 px/s.
-          3. Absolute acceleration limit: |a| <= 35,000.0 px/s^2.
-          4. Forward-backward velocity profiling and minimum-jerk shock absorption.
+        Enforces continuous physiological constraints across single or multi-segment paths:
+          1. Continuous Savitzky-Golay coordinate smoothing (eliminates quantization staircasing).
+          2. Soft-saturation velocity ceiling via hyperbolic tangent (eliminates flat plateaus & zero-acceleration deadbands):
+             v_sat = v_thresh + (v_max - v_thresh) * tanh((v - v_thresh) / (v_max - v_thresh)) for v > v_thresh.
+          3. Strict lower-bound on delta time: dt >= 7.0 ms (125-142 Hz hardware polling).
+          4. Forward-backward velocity profiling bounding acceleration |a| <= 35,000.0 px/s^2.
         """
         if not trajectory or len(trajectory) < 3:
             return trajectory
@@ -571,54 +598,78 @@ class HumanMouse:
         for i in range(1, N):
             out[i]['dt_ms'] = max(min_dt_ms, float(out[i]['dt_ms']))
 
-        # 2. Extract discrete positions and displacements
+        # 2. Extract discrete positions and apply continuous smoothing to eliminate staircasing
         xs = np.array([p['x'] for p in out], dtype=np.float64)
         ys = np.array([p['y'] for p in out], dtype=np.float64)
-        dists = np.hypot(np.diff(xs), np.diff(ys))  # length N-1
 
-        # 3. Dynamic Forward-Backward Velocity & Acceleration Profiling
-        dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / max_velocity)
-        v_profile = dists / dt_clamped
-        effective_a_max = max_acceleration * 0.90
+        if N >= 9:
+            if SCIPY_AVAILABLE:
+                s_xs = savgol_filter(xs, window_length=9, polyorder=2)
+                s_ys = savgol_filter(ys, window_length=9, polyorder=2)
+            else:
+                kernel = np.array([0.05, 0.25, 0.40, 0.25, 0.05])
+                s_xs = np.convolve(xs, kernel, mode='same')
+                s_ys = np.convolve(ys, kernel, mode='same')
+            # Strict boundary anchor to preserve starting coordinate and exact target landing
+            s_xs[0], s_ys[0] = xs[0], ys[0]
+            s_xs[-1], s_ys[-1] = xs[-1], ys[-1]
+        else:
+            s_xs, s_ys = xs, ys
 
-        for i in range(len(v_profile)):
+        for i in range(N):
+            out[i]['x'] = s_xs[i]
+            out[i]['y'] = s_ys[i]
+
+        dists = np.hypot(np.diff(s_xs), np.diff(s_ys))  # length N-1
+        raw_dts = np.array([p['dt_ms'] / 1000.0 for p in out[1:]], dtype=np.float64)
+        v_raw = dists / np.maximum(1e-4, raw_dts)
+
+        # 3. Continuous Tanh-based Soft Velocity Saturation (preserves rounded bell curve crest)
+        scale = max(1.0, max_velocity - v_threshold)
+        v_sat = np.copy(v_raw)
+        mask = v_raw > v_threshold
+        if np.any(mask):
+            v_sat[mask] = v_threshold + scale * np.tanh((v_raw[mask] - v_threshold) / scale)
+
+        # 4. Dynamic Forward-Backward Acceleration Limiting
+        effective_a_max = max_acceleration * 0.82
+        dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / np.maximum(1e-4, v_sat))
+
+        for i in range(len(v_sat)):
             if dists[i] < 0.1:
-                v_profile[i] = 0.0
+                v_sat[i] = 0.0
 
         # Forward pass: v[i] <= v[i-1] + a_max * dt
-        for i in range(1, len(v_profile)):
+        for i in range(1, len(v_sat)):
             dt_step = dt_clamped[i]
-            if v_profile[i-1] == 0.0 and v_profile[i] > 0.0:
+            if v_sat[i-1] == 0.0 and v_sat[i] > 0.0:
                 min_dt_launch = math.sqrt(dists[i] / effective_a_max)
                 dt_clamped[i] = max(dt_clamped[i], min_dt_launch)
-                v_profile[i] = dists[i] / dt_clamped[i]
+                v_sat[i] = dists[i] / dt_clamped[i]
             else:
-                max_allowed_v = v_profile[i-1] + effective_a_max * dt_step
-                if v_profile[i] > max_allowed_v:
-                    v_profile[i] = max_allowed_v
-                    if v_profile[i] > 1e-4:
-                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_profile[i])
+                max_allowed_v = v_sat[i-1] + effective_a_max * dt_step
+                if v_sat[i] > max_allowed_v:
+                    v_sat[i] = max_allowed_v
+                    if v_sat[i] > 1e-4:
+                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_sat[i])
 
         # Backward pass: v[i] <= v[i+1] + a_max * dt
-        for i in range(len(v_profile) - 2, -1, -1):
+        for i in range(len(v_sat) - 2, -1, -1):
             dt_step = dt_clamped[i]
-            if v_profile[i+1] == 0.0 and v_profile[i] > 0.0:
+            if v_sat[i+1] == 0.0 and v_sat[i] > 0.0:
                 min_dt_stop = math.sqrt(dists[i] / effective_a_max)
                 dt_clamped[i] = max(dt_clamped[i], min_dt_stop)
-                v_profile[i] = dists[i] / dt_clamped[i]
+                v_sat[i] = dists[i] / dt_clamped[i]
             else:
-                max_allowed_v = v_profile[i+1] + effective_a_max * dt_step
-                if v_profile[i] > max_allowed_v:
-                    v_profile[i] = max_allowed_v
-                    if v_profile[i] > 1e-4:
-                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_profile[i])
+                max_allowed_v = v_sat[i+1] + effective_a_max * dt_step
+                if v_sat[i] > max_allowed_v:
+                    v_sat[i] = max_allowed_v
+                    if v_sat[i] > 1e-4:
+                        dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_sat[i])
 
-        # Re-apply updated dt_ms
+        # Re-apply updated dt_ms smoothly
         for i in range(1, N):
-            if dists[i-1] > 0.1:
-                out[i]['dt_ms'] = round(dt_clamped[i-1] * 1000.0, 2)
-            else:
-                out[i]['dt_ms'] = max(min_dt_ms, out[i]['dt_ms'])
+            out[i]['dt_ms'] = round(dt_clamped[i-1] * 1000.0, 3)
 
         return out
 
@@ -698,11 +749,22 @@ class HumanMouse:
             return (0.0, 0.0, 0.0, 0.1)
 
         # 1. Identify arrival velocity from moving steps prior to terminal rest
-        k = min(12, len(trajectory) - 1)
+        # Look back up to 28 steps to capture the approach momentum before final settling
+        k = min(28, len(trajectory) - 1)
         tail = trajectory[-k:]
         moving_steps = [s for s in tail if s.get('dt_ms', 0) > 0]
 
-        if len(moving_steps) >= 2:
+        if len(moving_steps) >= 6:
+            eval_steps = moving_steps[:max(2, len(moving_steps) - 6)]
+            dx_px = float(eval_steps[-1]['x'] - eval_steps[0]['x'])
+            dy_px = float(eval_steps[-1]['y'] - eval_steps[0]['y'])
+            dt_sum_sec = float(sum(s['dt_ms'] for s in eval_steps[1:]) / 1000.0)
+            if dt_sum_sec > 1e-4:
+                vx_px_s = dx_px / dt_sum_sec
+                vy_px_s = dy_px / dt_sum_sec
+            else:
+                vx_px_s, vy_px_s = 0.0, 0.0
+        elif len(moving_steps) >= 2:
             dx_px = float(moving_steps[-1]['x'] - moving_steps[0]['x'])
             dy_px = float(moving_steps[-1]['y'] - moving_steps[0]['y'])
             dt_sum_sec = float(sum(s['dt_ms'] for s in moving_steps[1:]) / 1000.0)
@@ -727,8 +789,8 @@ class HumanMouse:
         dwell_s = max(0.0, float(dwell_time_sec))
         decay_factor = math.exp(-dwell_s / tau_decay)
 
-        # If pause/dwell exceeds 50ms or speed is negligible, dissipate to complete rest
-        if dwell_s > 0.05 or (v_mag_px_s * decay_factor) < 15.0:
+        # If pause/dwell exceeds 100ms or decayed speed is negligible (<10 px/s), dissipate to complete rest
+        if dwell_s > 0.10 or (v_mag_px_s * decay_factor) < 10.0:
             vx_inflow = 0.0
             vy_inflow = 0.0
         else:

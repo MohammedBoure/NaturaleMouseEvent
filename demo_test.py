@@ -254,19 +254,25 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     traj1 = mouse.generate_trajectory(pt_a, pt_b, prev_context=None, intent=1.0)
     arr_momentum = mouse.compute_terminal_momentum(traj1, dwell_time_sec=0.04)
 
+    # Cleanly drop any trailing duplicate stationary resting step from traj1 at in-flight junction
+    if len(traj1) > 1 and np.hypot(traj1[-1]['x'] - traj1[-2]['x'], traj1[-1]['y'] - traj1[-2]['y']) < 0.1:
+        traj1_chain = traj1[:-1]
+    else:
+        traj1_chain = traj1
+
     # Segment 2: B -> C initialized with the arrival momentum from Segment 1
-    actual_b = (float(traj1[-1]['x']), float(traj1[-1]['y']))
+    actual_b = (float(traj1_chain[-1]['x']), float(traj1_chain[-1]['y']))
     traj2 = mouse.generate_trajectory(actual_b, pt_c, prev_context=arr_momentum, intent=1.0)
 
     # Combine trajectories and apply global biomechanical safety filter across concatenated multi-segment path
-    combined_raw = traj1 + traj2[1:]
+    combined_raw = traj1_chain + traj2[1:]
     combined_traj = mouse.apply_biomechanical_kinematic_filter(
-        combined_raw, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0
+        combined_raw, v_threshold=1700.0, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0
     )
 
-    xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float32)
-    ys = np.array([pt['y'] for pt in combined_traj], dtype=np.float32)
-    dts = np.array([pt['dt_ms'] for pt in combined_traj], dtype=np.float32)
+    xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float64)
+    ys = np.array([pt['y'] for pt in combined_traj], dtype=np.float64)
+    dts = np.array([pt['dt_ms'] for pt in combined_traj], dtype=np.float64)
     timestamps = np.cumsum(dts)
 
     # Compute continuous kinematics
@@ -315,7 +321,7 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     ax1.legend(loc='lower left', facecolor='#21262d', edgecolor='#30363d', labelcolor='white', fontsize=8.5)
 
     # Subplot 2: Continuous Velocity Profile
-    split_time = timestamps[len(traj1) - 1]
+    split_time = timestamps[len(traj1_chain) - 1]
     ax2 = axes[1]
     ax2.set_facecolor('#121212')
     ax2.plot(timestamps[1:], velocities_px_per_s, color='#3fb950', linewidth=1.8)
