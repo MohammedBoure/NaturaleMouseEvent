@@ -466,7 +466,7 @@ def run_pilot_training(
     val_len = total_len - train_len
 
     if full or total_len >= 50000:
-        print(f"[Dataset] Full training mode enabled: using all {total_len:,} episodes (Train: {train_len:,}, Val: {val_len:,})")
+        print(f"[Dataset] Training on FULL dataset: {total_len:,} episodes (Train: {train_len:,}, Val: {val_len:,}).")
     print(f"[Split] Train Set: {train_len:,} episodes ({train_split*100:.0f}%) | Validation Set: {val_len:,} episodes ({(1-train_split)*100:.0f}%)")
 
     train_set, val_set = torch.utils.data.random_split(
@@ -475,27 +475,31 @@ def run_pilot_training(
         generator=torch.Generator().manual_seed(42)
     )
 
-    # GPU DataLoader throughput optimization: pin_memory and multi-process workers
+    # GPU DataLoader throughput optimization: pin_memory, prefetch_factor, and multi-process workers
     pin_memory = use_cuda
     loader_workers = max(0, num_workers)
-    print(f"[DataLoader] Configuration: num_workers={loader_workers}, pin_memory={pin_memory}, batch_size={batch_size}")
+    loader_kwargs = {
+        'num_workers': loader_workers,
+        'pin_memory': pin_memory,
+        'persistent_workers': (loader_workers > 0)
+    }
+    if loader_workers > 0:
+        loader_kwargs['prefetch_factor'] = 2
+
+    print(f"[DataLoader] Configuration: num_workers={loader_workers}, pin_memory={pin_memory}, persistent_workers={(loader_workers > 0)}, prefetch_factor={2 if loader_workers > 0 else 'N/A'}, batch_size={batch_size}")
 
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=loader_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(loader_workers > 0)
+        **loader_kwargs
     )
     val_loader = DataLoader(
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=loader_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(loader_workers > 0)
+        **loader_kwargs
     )
 
     # Initialize model
@@ -525,6 +529,11 @@ def run_pilot_training(
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=5e-5)
 
+    # Automatic Mixed Precision (AMP / FP16) for Tesla Tensor Cores acceleration
+    use_amp = use_cuda
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(f"[Precision] Automatic Mixed Precision (AMP): {'ENABLED (FP16 via Tensor Cores)' if use_amp else 'DISABLED (FP32 on CPU)'}")
+
     best_val_err = float('inf')
     best_epoch = 0
 
@@ -542,73 +551,27 @@ def run_pilot_training(
         tf_ratio = max(0.1, 0.8 - (epoch - 1) * (0.7 / max(1, epochs - 1)))
 
         for b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask in train_loader:
-            b_start = b_start.to(device)
-            b_tgt = b_tgt.to(device)
-            b_ctx = b_ctx.to(device)
-            b_intent = b_intent.to(device)
-            b_seq = b_seq.to(device)
-            b_mask = b_mask.to(device)
+            b_start = b_start.to(device, non_blocking=pin_memory)
+            b_tgt = b_tgt.to(device, non_blocking=pin_memory)
+            b_ctx = b_ctx.to(device, non_blocking=pin_memory)
+            b_intent = b_intent.to(device, non_blocking=pin_memory)
+            b_seq = b_seq.to(device, non_blocking=pin_memory)
+            b_mask = b_mask.to(device, non_blocking=pin_memory)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            pred_kin, pred_act, pred_traj = model(
-                start_pos=b_start,
-                target_pos=b_tgt,
-                ext_context=b_ctx,
-                intent=b_intent,
-                teacher_forcing_ratio=tf_ratio,
-                true_seq=b_seq,
-                masks=b_mask
-            )
-
-            loss, _ = criterion(
-                pred_kin=pred_kin,
-                pred_actions=pred_act,
-                pred_traj=pred_traj,
-                true_seq=b_seq,
-                true_target=b_tgt,
-                masks=b_mask,
-                start_pos=b_start,
-                ext_context=b_ctx
-            )
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            train_loss += loss.item()
-            train_batches += 1
-
-        scheduler.step()
-        avg_train_loss = train_loss / max(1, train_batches)
-
-        # Validation under pure autoregressive generation (tf_ratio = 0.0)
-        model.eval()
-        val_loss = 0.0
-        val_batches = 0
-        val_reach_px_list = []
-        val_jerk_list = []
-
-        with torch.no_grad():
-            for b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask in val_loader:
-                b_start = b_start.to(device)
-                b_tgt = b_tgt.to(device)
-                b_ctx = b_ctx.to(device)
-                b_intent = b_intent.to(device)
-                b_seq = b_seq.to(device)
-                b_mask = b_mask.to(device)
-
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 pred_kin, pred_act, pred_traj = model(
                     start_pos=b_start,
                     target_pos=b_tgt,
                     ext_context=b_ctx,
                     intent=b_intent,
-                    teacher_forcing_ratio=0.0,
-                    true_seq=None,
+                    teacher_forcing_ratio=tf_ratio,
+                    true_seq=b_seq,
                     masks=b_mask
                 )
 
-                loss, metrics = criterion(
+                loss, _ = criterion(
                     pred_kin=pred_kin,
                     pred_actions=pred_act,
                     pred_traj=pred_traj,
@@ -618,6 +581,57 @@ def run_pilot_training(
                     start_pos=b_start,
                     ext_context=b_ctx
                 )
+
+            # Mixed precision backward pass, unscale, gradient clipping, optimizer step
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+            train_batches += 1
+
+        scheduler.step()
+        avg_train_loss = train_loss / max(1, train_batches)
+
+        # Validation under pure autoregressive generation (tf_ratio = 0.0) with AMP
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        val_reach_px_list = []
+        val_jerk_list = []
+
+        with torch.no_grad():
+            for b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask in val_loader:
+                b_start = b_start.to(device, non_blocking=pin_memory)
+                b_tgt = b_tgt.to(device, non_blocking=pin_memory)
+                b_ctx = b_ctx.to(device, non_blocking=pin_memory)
+                b_intent = b_intent.to(device, non_blocking=pin_memory)
+                b_seq = b_seq.to(device, non_blocking=pin_memory)
+                b_mask = b_mask.to(device, non_blocking=pin_memory)
+
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    pred_kin, pred_act, pred_traj = model(
+                        start_pos=b_start,
+                        target_pos=b_tgt,
+                        ext_context=b_ctx,
+                        intent=b_intent,
+                        teacher_forcing_ratio=0.0,
+                        true_seq=None,
+                        masks=b_mask
+                    )
+
+                    loss, metrics = criterion(
+                        pred_kin=pred_kin,
+                        pred_actions=pred_act,
+                        pred_traj=pred_traj,
+                        true_seq=b_seq,
+                        true_target=b_tgt,
+                        masks=b_mask,
+                        start_pos=b_start,
+                        ext_context=b_ctx
+                    )
 
                 val_loss += loss.item()
                 val_reach_px_list.append(metrics['reach_px'])
@@ -759,7 +773,7 @@ if __name__ == '__main__':
     parser.add_argument("--full", action="store_true", help="Train on the ENTIRE dataset (all 53k episodes) without subsampling")
     parser.add_argument("--max_episodes", type=int, default=None, help="Explicit maximum number of episodes to train on (overrides --subset)")
     parser.add_argument("--subset", type=int, default=6000, help="Pilot subset size when --full is not specified (default: 6000)")
-    parser.add_argument("--train_split", type=float, default=0.85, help="Train/Validation split ratio (default: 0.85)")
+    parser.add_argument("--train_split", type=float, default=0.90, help="Train/Validation split ratio (default: 0.90 for 90/10 split)")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of DataLoader worker processes for fast GPU ingestion (default: 2)")
     parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs (default: 6)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size (default: 64)")
