@@ -204,14 +204,16 @@ def run_precision_click_demo(mouse: HumanMouse):
     run_countdown(seconds=3, message="Starting in")
 
     sw, sh = mouse.screen_w, mouse.screen_h
-    target_x = int(sw * 0.6)
-    target_y = int(sh * 0.4)
+    # Simulate an interactive UI button bounding box (x, y, w, h)
+    btn_box = (int(sw * 0.55), int(sh * 0.38), 160, 46)
+    sampled_target = mouse.sample_target_within_box(btn_box)
 
-    print(f" ➔ Navigating and clicking target at ({target_x}, {target_y})...")
-    mouse.click_at(target_x, target_y)
+    print(f" ➔ Target UI Element Bounding Box: {btn_box} (Center: ({btn_box[0] + btn_box[2]/2:.0f}, {btn_box[1] + btn_box[3]/2:.0f}))")
+    print(f" ➔ Biometric Dispersion Sampling: Intent Point ({sampled_target[0]:.1f}, {sampled_target[1]:.1f})...")
+    mouse.click_at(sampled_target[0], sampled_target[1])
     final_pos = mouse.get_current_position()
-    err = float(np.hypot(final_pos[0] - target_x, final_pos[1] - target_y))
-    print(f"   ✓ Click executed at {final_pos} | Reach error: {err:.1f} px\n")
+    err = float(np.hypot(final_pos[0] - sampled_target[0], final_pos[1] - sampled_target[1]))
+    print(f"   ✓ Click executed at {final_pos} | Reach error relative to sampled target: {err:.1f} px\n")
 
 
 def run_idle_wandering_demo(mouse: HumanMouse):

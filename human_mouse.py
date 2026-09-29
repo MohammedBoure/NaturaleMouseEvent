@@ -225,6 +225,54 @@ HumanMouseGenerator = MemoryConditionedMouseGenerator
 
 
 # =====================================================================
+# Target Sampling & Biometric Dispersion Utilities
+# =====================================================================
+
+def sample_target_within_box(box_bounds, sigma_scale=6.0, margin=2.0):
+    """
+    Samples an authentic human landing coordinate within a rectangular UI target bounding box.
+    Uses a truncated 2D Gaussian centered on the bounding box center:
+      sigma_x = width / sigma_scale (default w / 6, spanning ~99.7% of natural human dispersion within box)
+      sigma_y = height / sigma_scale (default h / 6)
+    Coordinates are strictly clamped within the box boundaries minus safety margin.
+
+    Args:
+        box_bounds (tuple or dict): (x, y, w, h) or dict with keys 'x', 'y', 'w', 'h'
+        sigma_scale (float): Divisor for Gaussian standard deviation (default 6.0)
+        margin (float): Safety padding from the box edge in pixels
+
+    Returns:
+        tuple: (target_x, target_y) as floats
+    """
+    if isinstance(box_bounds, dict):
+        bx = float(box_bounds.get('x', box_bounds.get('left', 0.0)))
+        by = float(box_bounds.get('y', box_bounds.get('top', 0.0)))
+        bw = float(box_bounds.get('w', box_bounds.get('width', 10.0)))
+        bh = float(box_bounds.get('h', box_bounds.get('height', 10.0)))
+    else:
+        bx, by, bw, bh = [float(v) for v in box_bounds]
+
+    center_x = bx + bw / 2.0
+    center_y = by + bh / 2.0
+
+    sigma_x = max(1.0, bw / float(sigma_scale))
+    sigma_y = max(1.0, bh / float(sigma_scale))
+
+    offset_x = float(np.random.normal(0.0, sigma_x))
+    offset_y = float(np.random.normal(0.0, sigma_y))
+
+    min_x = bx + margin
+    max_x = bx + max(margin, bw - margin)
+    min_y = by + margin
+    max_y = by + max(margin, bh - margin)
+
+    sample_x = max(min_x, min(max_x, center_x + offset_x))
+    sample_y = max(min_y, min(max_y, center_y + offset_y))
+
+    return (float(sample_x), float(sample_y))
+
+
+# =====================================================================
 # Trajectory Simulation Engine
 # =====================================================================
 
@@ -432,6 +480,18 @@ class HumanMouseSimulator:
             "type": "move"
         })
 
+        # Fitts's Law Dynamic Step & Duration Allocation:
+        # N_steps = int(N_base + k * log2(1 + distance / W_ref))
+        # Shorter trajectories (200-300 px) complete faster (~250-350 ms, 35-45 steps)
+        # Longer trajectories (800-1200 px) scale naturally (~550-750 ms, 65-85 steps)
+        w_ref = 50.0
+        fitts_index = math.log2(1.0 + max(0.0, init_dist) / w_ref)
+        target_steps = int(round(4.0 + 15.5 * fitts_index))
+        target_steps = max(30, min(95, target_steps))
+
+        min_ballistic_steps = max(16, int(round(target_steps * 0.65)))
+        max_ballistic_steps = max(min_ballistic_steps + 4, target_steps - 6)
+
         min_dist = float('inf')
         min_step = 0
 
@@ -492,30 +552,51 @@ class HumanMouseSimulator:
                 "type": action_type
             })
 
-            # Natural stopping condition 1: reached destination within target tolerance
-            if intent > 0.5 and dist_to_target <= target_radius and step > 10:
-                break
-
-            # Natural stopping condition 2: overshoot or loitering near target
-            if intent > 0.5 and step > min_step + 4 and min_dist < 30.0:
-                if dist_to_target > min_dist + 3.0 or cur_speed_px_s < 120.0:
-                    trajectory = trajectory[:min_step + 1]
+            # Stopping conditions coordinated with Fitts's Law dynamic step target
+            if intent > 0.5:
+                # 1. Reached destination within target tolerance and met minimum ballistic steps
+                if dist_to_target <= target_radius and step >= min_ballistic_steps:
                     break
 
-            # Natural stopping condition 3: terminal deceleration near target (eliminates dead idle zone)
-            if intent > 0.5 and step > 25 and dist_to_target < 28.0 and cur_speed_px_s < 80.0:
-                break
+                # 2. Overshoot or loitering near target
+                if step > min_step + 4 and min_dist < 28.0 and step >= min_ballistic_steps:
+                    if dist_to_target > min_dist + 2.5 or cur_speed_px_s < 100.0:
+                        trajectory = trajectory[:min_step + 1]
+                        break
 
-        # Asymptotic Deceleration & Target Settlement:
-        # Eliminates the artificial constant-velocity floor/plateau.
-        # Decelerates smoothly from incoming velocity to exactly 0.0 px/s at the target.
+                # 3. Terminal deceleration near target
+                if step >= min_ballistic_steps and dist_to_target < 28.0 and cur_speed_px_s < 85.0:
+                    break
+
+                # 4. Ballistic step ceiling
+                if step >= max_ballistic_steps:
+                    break
+
+        # Natural Human Settlement & Landing Phase:
+        # Decelerate smoothly to the authentic human endpoint without artificial 0.00px snapping.
         if intent > 0.5 and len(trajectory) > 0:
             last_pt = trajectory[-1]
-            rem_x = target_x - float(last_pt["x"])
-            rem_y = target_y - float(last_pt["y"])
+            p0_x, p0_y = float(last_pt["x"]), float(last_pt["y"])
+
+            # Authentic human terminal landing dispersion:
+            # Humans never snap with mathematical 0.00px precision to the target center.
+            # Intrinsic dispersion standard deviation (~0.8 - 1.6 px)
+            sigma_disp = max(0.6, min(1.6, target_radius * 0.35))
+            disp_x = float(np.random.normal(0.0, sigma_disp))
+            disp_y = float(np.random.normal(0.0, sigma_disp))
+            disp_mag = math.hypot(disp_x, disp_y)
+            if disp_mag > target_radius:
+                disp_x = (disp_x / disp_mag) * target_radius
+                disp_y = (disp_y / disp_mag) * target_radius
+
+            authentic_target_x = target_x + disp_x
+            authentic_target_y = target_y + disp_y
+
+            rem_x = authentic_target_x - p0_x
+            rem_y = authentic_target_y - p0_y
             rem_dist = float(np.hypot(rem_x, rem_y))
 
-            if rem_dist > 1.0:
+            if rem_dist > 0.8:
                 # Estimate incoming velocity from preceding steps
                 if len(trajectory) >= 3:
                     prev_pt = trajectory[-2]
@@ -540,18 +621,18 @@ class HumanMouseSimulator:
                     D_dec = rem_dist
 
                 target_dt_ms = 8.5
-                num_sub_steps = max(6, int(round((T_total * 1000.0) / target_dt_ms)))
+                remaining_budget = max(4, target_steps - len(trajectory))
+                num_sub_steps = min(22, max(remaining_budget, int(round((T_total * 1000.0) / target_dt_ms))))
                 actual_dt_sec = T_total / float(num_sub_steps)
                 sub_dt_ms = actual_dt_sec * 1000.0
 
-                p0_x, p0_y = float(last_pt["x"]), float(last_pt["y"])
                 f_c = min(0.70, D_coast / max(1e-4, rem_dist)) if rem_dist > D_dec else 0.0
 
                 for step_k in range(1, num_sub_steps + 1):
                     tau = step_k / float(num_sub_steps)
                     if step_k == num_sub_steps:
-                        curr_sub_x = float(target_x)
-                        curr_sub_y = float(target_y)
+                        curr_sub_x = float(authentic_target_x)
+                        curr_sub_y = float(authentic_target_y)
                     else:
                         if tau <= f_c and f_c > 0.0:
                             frac = tau
@@ -569,13 +650,44 @@ class HumanMouseSimulator:
                         "dt_ms": round(sub_dt_ms, 2),
                         "type": "move"
                     })
-            else:
-                trajectory.append({
-                    "x": float(target_x),
-                    "y": float(target_y),
-                    "dt_ms": 10.0,
-                    "type": "move"
-                })
+
+        # Minimum-Jerk Transition Smoothing (Momentum Chaining):
+        # When active inflow momentum is present, blend transition velocity over the first 4-8 steps
+        # using a quintic minimum-jerk polynomial S(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5.
+        # This guarantees C^2 continuity (eliminating delta a / dt jerk spikes) at waypoint junctions.
+        v_in_mag = math.hypot(vx_gated, vy_gated) if 'vx_gated' in locals() else 0.0
+        if v_in_mag > 15.0 and len(trajectory) >= 12:
+            K = min(6, len(trajectory) - 2)
+            orig_pts = [(p['x'], p['y']) for p in trajectory[:K + 1]]
+
+            for step_i in range(1, K + 1):
+                tau = step_i / float(K + 1)
+                s_tau = 10.0 * (tau ** 3) - 15.0 * (tau ** 4) + 6.0 * (tau ** 5)
+                w_in = 1.0 - s_tau
+                w_model = s_tau
+
+                dt_i = max(0.007, trajectory[step_i]['dt_ms'] / 1000.0)
+                v_model_x = (orig_pts[step_i][0] - orig_pts[step_i - 1][0]) / dt_i
+                v_model_y = (orig_pts[step_i][1] - orig_pts[step_i - 1][1]) / dt_i
+
+                v_blended_x = w_in * vx_gated + w_model * v_model_x
+                v_blended_y = w_in * vy_gated + w_model * v_model_y
+
+                new_x = trajectory[step_i - 1]['x'] + v_blended_x * dt_i
+                new_y = trajectory[step_i - 1]['y'] + v_blended_y * dt_i
+
+                trajectory[step_i]['x'] = float(new_x)
+                trajectory[step_i]['y'] = float(new_y)
+
+            # Feather coordinate offset smoothly across subsequent 10 steps to prevent drift
+            delta_x = trajectory[K]['x'] - orig_pts[K][0]
+            delta_y = trajectory[K]['y'] - orig_pts[K][1]
+            feather_steps = min(10, len(trajectory) - 1 - K)
+            for j in range(1, feather_steps + 1):
+                idx = K + j
+                decay = 1.0 - (j / float(feather_steps + 1))
+                trajectory[idx]['x'] += delta_x * decay
+                trajectory[idx]['y'] += delta_y * decay
 
         return trajectory
 
@@ -743,8 +855,14 @@ class HumanMouse:
             cumulative_target_sec = 0.0
 
             for step in trajectory:
-                dt_sec = step['dt_ms'] / 1000.0
-                cumulative_target_sec += dt_sec
+                dt_base_sec = step['dt_ms'] / 1000.0
+                # Hardware Polling Micro-Jitter (Live Execution Layer):
+                # Emulate real USB HID 125 Hz polling with OS scheduling jitter
+                # Delta t ~ N(mu=0.008s, sigma=0.0006s) clamped to [0.004, 0.012]s
+                jitter = float(np.random.normal(0.0, 0.0006))
+                dt_jittered = max(0.004, min(0.012, dt_base_sec + jitter))
+
+                cumulative_target_sec += dt_jittered
                 step_target_time = start_time + cumulative_target_sec
 
                 # Sub-millisecond hybrid sleep-spinwait pacing
@@ -914,8 +1032,19 @@ class HumanMouse:
 
         return trajectory
 
-    def click_at(self, target_x, target_y, button='left', delay_after=0.1, prev_context=None, target_radius=5.0):
-        """Moves mouse naturally to (target_x, target_y) and clicks."""
+    sample_target_within_box = staticmethod(sample_target_within_box)
+
+    def click_at(self, target_x, target_y=None, button='left', delay_after=0.1, prev_context=None, target_radius=5.0, target_box=None):
+        """
+        Moves mouse naturally to target and clicks with human kinematics.
+        If target_box=(x, y, w, h) is provided, samples an authentic human landing
+        coordinate within the box using a truncated 2D Gaussian.
+        """
+        if target_box is not None:
+            target_x, target_y = sample_target_within_box(target_box)
+        elif target_y is None and isinstance(target_x, (tuple, list, dict)):
+            target_x, target_y = sample_target_within_box(target_x)
+
         return self.move_to(target_x, target_y, click=True, button=button, delay_after=delay_after, prev_context=prev_context, target_radius=target_radius)
 
     def wander(self, radius=200, delay_after=0.1):
