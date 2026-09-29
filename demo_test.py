@@ -269,7 +269,7 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     # Combine trajectories and apply global biomechanical safety filter across concatenated multi-segment path
     combined_raw = traj1_chain + traj2[1:]
     combined_traj = mouse.apply_biomechanical_kinematic_filter(
-        combined_raw, v_threshold=1700.0, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0
+        combined_raw, max_acceleration=45000.0, min_dt_ms=7.0
     )
 
     xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float64)

@@ -369,6 +369,50 @@ class HumanMouseSimulator:
         else:
             ctx_arr = [float(c) for c in list(prev_context)[:self.context_dim]]
 
+        # Directional Momentum Gating (Anti-Kink / No Backtracking):
+        # Prevent acute retrograde hooks when incoming velocity opposes target direction (angle >= 90 deg)
+        dx_tgt = target_x - start_x
+        dy_tgt = target_y - start_y
+        dist_tgt = math.hypot(dx_tgt, dy_tgt)
+
+        if dist_tgt > 1e-3 and (ctx_arr[0] != 0.0 or ctx_arr[1] != 0.0):
+            u_x = dx_tgt / dist_tgt
+            u_y = dy_tgt / dist_tgt
+
+            # Inflow velocity in screen pixels/second
+            vx_in_px = ctx_arr[0] * self.display_w
+            vy_in_px = ctx_arr[1] * self.display_h
+            v_in_mag = math.hypot(vx_in_px, vy_in_px)
+
+            if v_in_mag > 1e-3:
+                # Dot product / projection onto target vector
+                v_parallel = vx_in_px * u_x + vy_in_px * u_y
+                cos_sim = v_parallel / v_in_mag
+
+                # Decompose into parallel and perpendicular (normal/tangential) components
+                v_para_x = v_parallel * u_x
+                v_para_y = v_parallel * u_y
+                v_perp_x = vx_in_px - v_para_x
+                v_perp_y = vy_in_px - v_para_y
+
+                if cos_sim <= 0.0:
+                    # Opposing momentum (angle >= 90 deg):
+                    # Suppress retrograde component so momentum does not project backward into negative progress.
+                    # Retain only the perpendicular (tangential) component with graceful turning decay.
+                    turn_damping = max(0.0, float(1.0 + cos_sim) ** 1.5)
+                    vx_gated = v_perp_x * turn_damping
+                    vy_gated = v_perp_y * turn_damping
+                else:
+                    # Aligned momentum (acute angle < 90 deg):
+                    # Retain forward and tangential components for fluid Bezier-like corner rounding
+                    vx_gated = vx_in_px
+                    vy_gated = vy_in_px
+
+                ctx_arr[0] = float(vx_gated / self.display_w)
+                ctx_arr[1] = float(vy_gated / self.display_h)
+                if self.context_dim == 8:
+                    ctx_arr[7] = float(math.hypot(ctx_arr[0], ctx_arr[1]))
+
         ctx_t = torch.tensor([ctx_arr], dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
@@ -580,15 +624,16 @@ class HumanMouse:
         return self.apply_biomechanical_kinematic_filter(raw_traj)
 
     @staticmethod
-    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=1700.0, max_velocity=2200.0, max_acceleration=35000.0, min_dt_ms=7.0):
+    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=None, max_velocity=None, max_acceleration=45000.0, min_dt_ms=7.0):
         """
         Global Biomechanical Safety Filter.
         Enforces continuous physiological constraints across single or multi-segment paths:
           1. Continuous Savitzky-Golay coordinate smoothing (eliminates quantization staircasing).
-          2. Soft-saturation velocity ceiling via hyperbolic tangent (eliminates flat plateaus & zero-acceleration deadbands):
-             v_sat = v_thresh + (v_max - v_thresh) * tanh((v - v_thresh) / (v_max - v_thresh)) for v > v_thresh.
+          2. Soft dynamic velocity shaping via algebraic saturation and Fitts-scaled dynamic ceiling:
+             v_sat = v_raw / (1 + (v_raw / effective_v_max)^4)^(1/4)
+             Eliminates flatline plateaus and preserves the natural biological bell curve crest.
           3. Strict lower-bound on delta time: dt >= 7.0 ms (125-142 Hz hardware polling).
-          4. Forward-backward velocity profiling bounding acceleration |a| <= 35,000.0 px/s^2.
+          4. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration.
         """
         if not trajectory or len(trajectory) < 3:
             return trajectory
@@ -626,15 +671,19 @@ class HumanMouse:
         raw_dts = np.array([p['dt_ms'] / 1000.0 for p in out[1:]], dtype=np.float64)
         v_raw = dists / np.maximum(1e-4, raw_dts)
 
-        # 3. Continuous Tanh-based Soft Velocity Saturation (preserves rounded bell curve crest)
-        scale = max(1.0, max_velocity - v_threshold)
-        v_sat = np.copy(v_raw)
-        mask = v_raw > v_threshold
-        if np.any(mask):
-            v_sat[mask] = v_threshold + scale * np.tanh((v_raw[mask] - v_threshold) / scale)
+        # 3. Dynamic Distance-Adaptive Fitts Ceiling & Continuous Algebraic Soft Saturation
+        # Eliminates horizontal flatlines by maintaining strictly positive derivative d(v_sat)/d(v_raw) > 0.
+        total_dist = float(np.sum(dists))
+        fitts_ceiling = max(4500.0, 160.0 * math.sqrt(max(1.0, total_dist)))
+        if max_velocity is not None and max_velocity > 2800.0:
+            effective_v_max = max(float(max_velocity), fitts_ceiling)
+        else:
+            effective_v_max = fitts_ceiling
+
+        v_sat = v_raw / ((1.0 + (v_raw / effective_v_max) ** 4) ** 0.25)
 
         # 4. Dynamic Forward-Backward Acceleration Limiting
-        effective_a_max = max_acceleration * 0.82
+        effective_a_max = max_acceleration * 0.90
         dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / np.maximum(1e-4, v_sat))
 
         for i in range(len(v_sat)):
