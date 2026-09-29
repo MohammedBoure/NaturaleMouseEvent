@@ -19,6 +19,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+
 if hasattr(sys.stdout, 'reconfigure'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
@@ -475,15 +482,16 @@ def run_pilot_training(
         generator=torch.Generator().manual_seed(42)
     )
 
-    # GPU DataLoader throughput optimization: pin_memory, prefetch_factor, and multi-process workers
+    # GPU DataLoader throughput optimization: pin_memory and worker safety
     pin_memory = use_cuda
     loader_workers = max(0, num_workers)
     loader_kwargs = {
         'num_workers': loader_workers,
         'pin_memory': pin_memory,
-        'persistent_workers': (loader_workers > 0)
     }
+    # persistent_workers and prefetch_factor are only valid when num_workers > 0
     if loader_workers > 0:
+        loader_kwargs['persistent_workers'] = True
         loader_kwargs['prefetch_factor'] = 2
 
     print(f"[DataLoader] Configuration: num_workers={loader_workers}, pin_memory={pin_memory}, persistent_workers={(loader_workers > 0)}, prefetch_factor={2 if loader_workers > 0 else 'N/A'}, batch_size={batch_size}")
@@ -531,7 +539,7 @@ def run_pilot_training(
 
     # Automatic Mixed Precision (AMP / FP16) for Tesla Tensor Cores acceleration
     use_amp = use_cuda
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     print(f"[Precision] Automatic Mixed Precision (AMP): {'ENABLED (FP16 via Tensor Cores)' if use_amp else 'DISABLED (FP32 on CPU)'}")
 
     best_val_err = float('inf')
@@ -540,6 +548,9 @@ def run_pilot_training(
     print("\n-----------------------------------------------------------------------------------------------------------------")
     print(f"{'Epoch':^9} | {'LR':^9} | {'Train Loss':^11} | {'Val Loss':^10} | {'Val Reach Err':^15} | {'Mean Jerk':^11} | {'Time':^7}")
     print("-----------------------------------------------------------------------------------------------------------------")
+
+    total_train_batches = len(train_loader)
+    total_val_batches = len(val_loader)
 
     for epoch in range(1, epochs + 1):
         t0 = time.perf_counter()
@@ -550,7 +561,11 @@ def run_pilot_training(
         # Teacher forcing ratio decays from 0.8 to 0.1 across pilot epochs
         tf_ratio = max(0.1, 0.8 - (epoch - 1) * (0.7 / max(1, epochs - 1)))
 
-        for b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask in train_loader:
+        train_iter = train_loader
+        if TQDM_AVAILABLE and (full or total_len >= 10000):
+            train_iter = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs} [Train]", leave=False)
+
+        for b_idx, (b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask) in enumerate(train_iter):
             b_start = b_start.to(device, non_blocking=pin_memory)
             b_tgt = b_tgt.to(device, non_blocking=pin_memory)
             b_ctx = b_ctx.to(device, non_blocking=pin_memory)
@@ -560,7 +575,7 @@ def run_pilot_training(
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 pred_kin, pred_act, pred_traj = model(
                     start_pos=b_start,
                     target_pos=b_tgt,
@@ -592,6 +607,9 @@ def run_pilot_training(
             train_loss += loss.item()
             train_batches += 1
 
+            if not TQDM_AVAILABLE and (b_idx + 1) % 50 == 0:
+                print(f"  [Epoch {epoch}/{epochs}] Step {b_idx + 1}/{total_train_batches} | Batch Loss: {loss.item():.4f}", flush=True)
+
         scheduler.step()
         avg_train_loss = train_loss / max(1, train_batches)
 
@@ -602,8 +620,12 @@ def run_pilot_training(
         val_reach_px_list = []
         val_jerk_list = []
 
+        val_iter = val_loader
+        if TQDM_AVAILABLE and (full or total_len >= 10000):
+            val_iter = tqdm(val_loader, desc=f"Epoch {epoch}/{epochs} [Val]", leave=False)
+
         with torch.no_grad():
-            for b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask in val_loader:
+            for b_idx, (b_start, b_tgt, b_ctx, b_intent, b_seq, b_mask) in enumerate(val_iter):
                 b_start = b_start.to(device, non_blocking=pin_memory)
                 b_tgt = b_tgt.to(device, non_blocking=pin_memory)
                 b_ctx = b_ctx.to(device, non_blocking=pin_memory)
@@ -611,7 +633,7 @@ def run_pilot_training(
                 b_seq = b_seq.to(device, non_blocking=pin_memory)
                 b_mask = b_mask.to(device, non_blocking=pin_memory)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast('cuda', enabled=use_amp):
                     pred_kin, pred_act, pred_traj = model(
                         start_pos=b_start,
                         target_pos=b_tgt,
@@ -637,6 +659,9 @@ def run_pilot_training(
                 val_reach_px_list.append(metrics['reach_px'])
                 val_jerk_list.append(metrics['loss_jerk'])
                 val_batches += 1
+
+                if not TQDM_AVAILABLE and (b_idx + 1) % 50 == 0:
+                    print(f"  [Epoch {epoch}/{epochs}] Val Step {b_idx + 1}/{total_val_batches}", flush=True)
 
         avg_val_loss = val_loss / max(1, val_batches)
         avg_reach_px = np.mean(val_reach_px_list)
@@ -774,7 +799,7 @@ if __name__ == '__main__':
     parser.add_argument("--max_episodes", type=int, default=None, help="Explicit maximum number of episodes to train on (overrides --subset)")
     parser.add_argument("--subset", type=int, default=6000, help="Pilot subset size when --full is not specified (default: 6000)")
     parser.add_argument("--train_split", type=float, default=0.90, help="Train/Validation split ratio (default: 0.90 for 90/10 split)")
-    parser.add_argument("--num_workers", type=int, default=2, help="Number of DataLoader worker processes for fast GPU ingestion (default: 2)")
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of DataLoader worker processes (default: 0 for in-memory fast tensor access, avoids Colab fork deadlocks)")
     parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs (default: 6)")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001)")

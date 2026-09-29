@@ -41,15 +41,15 @@ python train_pilot.py --data data/mouse_dataset_fixed_N256_full.npz --subset 600
 ```
 
 ### Production Training (Full 53,028 Episodes on GPU / Colab T4)
-Train across 100% of the trajectory dataset with Kinematic Memory, Automatic Mixed Precision (`torch.cuda.amp` FP16 Tensor Cores), pinned GPU memory, and parallel multi-worker streaming:
+Train across 100% of the trajectory dataset with Kinematic Memory, Automatic Mixed Precision (`torch.amp` FP16 Tensor Cores), and pinned GPU memory:
 
 ```bash
 # Production training on all 53,028 episodes (90/10 split: 47,725 train / 5,303 val)
-# Auto-enables AMP (FP16), pin_memory=True, prefetch_factor=2, persistent_workers=True
-python train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 2 --save_path models/production_mouse_model.pth
+# Auto-enables AMP (FP16), pin_memory=True, and in-memory direct indexing (num_workers=0)
+python train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 0 --save_path models/production_mouse_model.pth
 
 # Or train on a custom number of episodes (e.g., 25,000)
-python train_pilot.py --max_episodes 25000 --epochs 8 --batch_size 128 --num_workers 2
+python train_pilot.py --max_episodes 25000 --epochs 8 --batch_size 128 --num_workers 0
 ```
 
 ### Full Legacy Model Training (Baseline Pipeline)
