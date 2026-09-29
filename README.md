@@ -28,6 +28,7 @@ An AI-powered system designed to generate biologically authentic, human-like mou
   - Initial 10-step smoothstep muscle recruitment ramp bounding acceleration strictly below $90,000\text{ px/s}^2$ from rest.
 - **`models/`**: Directory containing trained PyTorch neural network checkpoints (`pilot_mouse_model.pth`) and its [README.md](file:///D:/git/NaturaleMouseEvent/models/README.md).
 - **`data/`**: Data directory containing preprocessed trajectory datasets (`mouse_dataset_fixed_N256_full.npz`) and its [README.md](file:///D:/git/NaturaleMouseEvent/data/README.md).
+- **`requirements.txt`**: Complete list of Python project dependencies across model training, preprocessing, filtering, visualization, and live automation.
 - **`human_mouse_engine/`**: Standalone packaged engine module and CLI utilities with documentation.
 
 ## Training the Model
