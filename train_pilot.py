@@ -438,7 +438,8 @@ def run_pilot_training(
     epochs: int = 6,
     batch_size: int = 64,
     lr: float = 1e-3,
-    save_path: str = "models/pilot_mouse_model.pth"
+    save_path: str = "models/pilot_mouse_model.pth",
+    resume: Optional[str] = None
 ):
     print("\n==========================================================================")
     if full:
@@ -446,6 +447,8 @@ def run_pilot_training(
     else:
         print(" 🔬 INITIATING PILOT TRAINING: EXTENDED MOTION HISTORY CONTEXT")
     print(f" Mode: {'Full Dataset (All Episodes)' if full else f'Subset ({max_episodes or subset_size} episodes)'} | Epochs: {epochs} | Batch Size: {batch_size}")
+    if resume:
+        print(f" Resume: Resuming from checkpoint: {resume}")
     print("==========================================================================\n")
 
     # Select optimal device and threads
@@ -534,16 +537,58 @@ def run_pilot_training(
         w_action=0.5
     ).to(device)
 
+    # Resume training / warm-start from existing checkpoint if requested
+    start_epoch = 1
+    best_val_err = float('inf')
+    best_epoch = 0
+
+    if resume:
+        if not os.path.exists(resume):
+            raise FileNotFoundError(f"Resume checkpoint file not found at: {resume}")
+
+        print(f"[Resume] Loading checkpoint from: {resume}")
+        checkpoint = torch.load(resume, map_location=device, weights_only=False)
+
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            loaded_epoch = checkpoint.get('epoch', 0)
+            saved_val_err = checkpoint.get('val_reach_px', float('inf'))
+            if saved_val_err < best_val_err:
+                best_val_err = saved_val_err
+                best_epoch = loaded_epoch
+
+            model.load_state_dict(state_dict, strict=False)
+            start_epoch = loaded_epoch + 1
+            print(f"[Resume] Successfully restored model weights from {resume}. (Loaded Epoch {loaded_epoch}, Val Reach: {saved_val_err:.1f} px). Resuming training from Epoch {start_epoch} up to Epoch {epochs}...")
+        else:
+            # Raw state dict
+            state_dict = checkpoint
+            model.load_state_dict(state_dict, strict=False)
+            print(f"[Resume] Successfully restored raw model state dict from {resume}. Resuming training...")
+
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=5e-5)
+
+    # If structured checkpoint contains optimizer state, attempt to restore it
+    if resume and isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"[Resume] Successfully restored optimizer state.")
+        except Exception as e:
+            print(f"[Resume] Notice: Could not restore optimizer state ({e}). Proceeding with freshly initialized optimizer.")
+
+    # Ensure 'initial_lr' is registered in all param groups for lr_scheduler compatibility
+    for group in optimizer.param_groups:
+        group.setdefault('initial_lr', group.get('lr', lr))
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=5e-5, last_epoch=start_epoch - 2 if start_epoch > 1 else -1)
 
     # Automatic Mixed Precision (AMP / FP16) for Tesla Tensor Cores acceleration
     use_amp = use_cuda
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     print(f"[Precision] Automatic Mixed Precision (AMP): {'ENABLED (FP16 via Tensor Cores)' if use_amp else 'DISABLED (FP32 on CPU)'}")
 
-    best_val_err = float('inf')
-    best_epoch = 0
+    if start_epoch > epochs:
+        print(f"[Notice] Checkpoint already reached Epoch {start_epoch - 1} >= requested epochs ({epochs}). Skipping training loop.")
 
     print("\n-----------------------------------------------------------------------------------------------------------------")
     print(f"{'Epoch':^9} | {'LR':^9} | {'Train Loss':^11} | {'Val Loss':^10} | {'Val Reach Err':^15} | {'Mean Jerk':^11} | {'Time':^7}")
@@ -552,7 +597,7 @@ def run_pilot_training(
     total_train_batches = len(train_loader)
     total_val_batches = len(val_loader)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.perf_counter()
         model.train()
         train_loss = 0.0
@@ -804,6 +849,7 @@ if __name__ == '__main__':
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size (default: 64)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001)")
     parser.add_argument("--save_path", type=str, default=None, help="Output checkpoint path (default: models/production_mouse_model.pth if --full else models/pilot_mouse_model.pth)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pth to resume training from")
 
     args = parser.parse_args()
 
@@ -826,7 +872,8 @@ if __name__ == '__main__':
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        save_path=effective_save_path
+        save_path=effective_save_path,
+        resume=args.resume
     )
 
     device = next(trained_model.parameters()).device

@@ -48,6 +48,9 @@ Train across 100% of the trajectory dataset with Kinematic Memory, Automatic Mix
 # Auto-enables AMP (FP16), pin_memory=True, and in-memory direct indexing (num_workers=0)
 python train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 0 --save_path models/production_mouse_model.pth
 
+# Resume / Warm-Start from an existing checkpoint (e.g. continuing from Epoch 7 up to Epoch 12)
+python train_pilot.py --full --epochs 12 --batch_size 128 --num_workers 0 --resume models/production_mouse_model.pth --save_path models/production_mouse_model.pth
+
 # Or train on a custom number of episodes (e.g., 25,000)
 python train_pilot.py --max_episodes 25000 --epochs 8 --batch_size 128 --num_workers 0
 ```
