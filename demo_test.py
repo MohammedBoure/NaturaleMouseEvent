@@ -53,8 +53,10 @@ def resolve_model_path(cli_model: Optional[str] = None) -> Optional[str]:
         print(f"[Model Config] Warning: Specified checkpoint '{cli_model}' not found.")
         print(f"[Model Config] Attempting fallback to default pilot model: {default_pilot}")
 
-    # Check for default pilot model
+    # Check for models in priority order
     candidates = [
+        "models/production_mouse_model.pth",
+        os.path.join(script_dir, "models/production_mouse_model.pth"),
         default_pilot,
         os.path.join(script_dir, default_pilot),
         "best_model.pth",

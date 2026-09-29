@@ -34,14 +34,25 @@ An AI-powered system designed to generate biologically authentic, human-like mou
 ## Training the Model
 
 ### Pilot Training with Kinematic Memory (Local Subset)
-Run the pilot training pipeline with 8D motion history context and bio-jerk regularization:
+Run the pilot training pipeline with 8D motion history context and bio-jerk regularization on a local subset:
 
 ```bash
 python train_pilot.py --data data/mouse_dataset_fixed_N256_full.npz --subset 6000 --epochs 6 --batch_size 64 --save_path models/pilot_mouse_model.pth
 ```
 
-### Full Model Training (Production Pipeline)
-Run the training pipeline with default parameters:
+### Production Training (Full 53,028 Episodes on GPU / Colab T4)
+Train across 100% of the trajectory dataset with Kinematic Memory, multi-process DataLoader workers, and pinned GPU memory:
+
+```bash
+# Production training on all 53,028 episodes (saves to models/production_mouse_model.pth)
+python train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 4 --save_path models/production_mouse_model.pth
+
+# Or train on a custom number of episodes (e.g., 25,000)
+python train_pilot.py --max_episodes 25000 --epochs 8 --batch_size 128 --num_workers 4
+```
+
+### Full Legacy Model Training (Baseline Pipeline)
+Run the baseline training pipeline with default parameters:
 
 ```bash
 python train_model.py --epochs 40 --batch_size 64 --lr 0.001

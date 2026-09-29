@@ -250,6 +250,8 @@ class HumanMouseSimulator:
                 os.path.join(script_dir, model_path)
             ])
         candidate_paths.extend([
+            "models/production_mouse_model.pth",
+            os.path.join(script_dir, "models/production_mouse_model.pth"),
             "models/pilot_mouse_model.pth",
             os.path.join(script_dir, "models/pilot_mouse_model.pth"),
             "best_model.pth",

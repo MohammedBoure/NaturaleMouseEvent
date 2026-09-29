@@ -21,3 +21,10 @@ This directory stores trained PyTorch neural network checkpoints, weights, and e
   - *Short Precision Movement (100 px)*: Final Reach Error: 0.00 px, Natural Arc
   - *Medium Diagonal Crossing (500 px)*: Final Reach Error: 0.00 px, Natural Arc
   - *Long Ballistic Movement (1365 px)*: Final Reach Error: 0.00 px, Natural Arc
+
+### 2. `production_mouse_model.pth`
+- **Architecture**: `MemoryConditionedMouseGenerator` (901,767 parameters).
+- **Target Ingestion**: Trained across 100% of the trajectory archive (`data/mouse_dataset_fixed_N256_full.npz`, all 53,028 human episodes).
+- **Split**: 85/15 stratified train/val split (45,073 train / 7,955 validation episodes).
+- **Execution**: Run with `--full` on GPU (`pin_memory=True`, `num_workers=4`). Auto-discovered by `HumanMouse` API and CLI utilities with top priority.
+

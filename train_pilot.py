@@ -32,7 +32,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 class PilotKinematicDataset(Dataset):
     """
-    Subsets and prepares episodes with Extended Motion History Context:
+    Subsets or loads all episodes with Extended Motion History Context:
     - start_pos: (2,) normalized [x0, y0]
     - target_pos: (2,) normalized [xtgt, ytgt]
     - extended_context: (8,) [vx_prev, vy_prev, dt_dwell, dx_jump, dy_jump, click_density, avg_dt, momentum_mag]
@@ -40,7 +40,7 @@ class PilotKinematicDataset(Dataset):
     - seq_tensor: (256, 6) [dx, dy, dt, rem_x, rem_y, action_code]
     - mask: (256,) valid step indicator
     """
-    def __init__(self, npz_path: str, subset_size: int = 6000, seed: int = 42):
+    def __init__(self, npz_path: str, subset_size: Optional[int] = 6000, full_dataset: bool = False, max_episodes: Optional[int] = None, seed: int = 42):
         if not os.path.exists(npz_path):
             raise FileNotFoundError(f"Dataset archive not found at: {npz_path}")
 
@@ -50,13 +50,37 @@ class PilotKinematicDataset(Dataset):
         total_available = len(data['start_targets'])
         print(f"[Dataset] Total episodes available: {total_available:,}")
 
-        # Stratified deterministic index sampling across the dataset
-        random.seed(seed)
-        np.random.seed(seed)
-        step_stride = max(1, total_available // subset_size)
-        indices = np.arange(0, total_available, step_stride)[:subset_size]
-        actual_size = len(indices)
-        print(f"[Dataset] Sliced representative pilot subset: {actual_size:,} episodes (stride={step_stride})")
+        if full_dataset or (subset_size is None and max_episodes is None):
+            indices = np.arange(total_available)
+            actual_size = total_available
+            print(f"[Dataset] Full training mode enabled: using all {actual_size:,} episodes (no subsampling/striding).")
+        elif max_episodes is not None and max_episodes > 0:
+            target_size = min(max_episodes, total_available)
+            if target_size >= total_available:
+                indices = np.arange(total_available)
+                actual_size = total_available
+                print(f"[Dataset] Full training mode enabled: using all {actual_size:,} episodes.")
+            else:
+                random.seed(seed)
+                np.random.seed(seed)
+                step_stride = max(1, total_available // target_size)
+                indices = np.arange(0, total_available, step_stride)[:target_size]
+                actual_size = len(indices)
+                print(f"[Dataset] Selected {actual_size:,} episodes with stratified sampling (stride={step_stride}, max_episodes={max_episodes:,})")
+        else:
+            # Pilot subset mode (default 6,000)
+            target_size = min(subset_size or 6000, total_available)
+            if target_size >= total_available:
+                indices = np.arange(total_available)
+                actual_size = total_available
+                print(f"[Dataset] Full training mode enabled: using all {actual_size:,} episodes.")
+            else:
+                random.seed(seed)
+                np.random.seed(seed)
+                step_stride = max(1, total_available // target_size)
+                indices = np.arange(0, total_available, step_stride)[:target_size]
+                actual_size = len(indices)
+                print(f"[Dataset] Sliced representative pilot subset: {actual_size:,} episodes (stride={step_stride})")
 
         start_targets = data['start_targets'][indices]
         seq_tensors = data['seq_tensors'][indices]
@@ -64,39 +88,23 @@ class PilotKinematicDataset(Dataset):
         prev_contexts = data['prev_contexts'][indices]
         intents = data['intents'][indices]
 
-        # Construct Extended 8D Motion History Context
+        # Construct Extended 8D Motion History Context via Vectorized NumPy
         # [vx_prev, vy_prev, dt_dwell, dx_jump, dy_jump, click_density, avg_dt, momentum_mag]
         N = actual_size
         ext_contexts = np.zeros((N, 8), dtype=np.float32)
 
-        for i in range(N):
-            vx0 = prev_contexts[i, 0]
-            vy0 = prev_contexts[i, 1]
-            click_density = prev_contexts[i, 2]
-            avg_dt = prev_contexts[i, 3]
+        # Baseline momentum and session features
+        ext_contexts[:, 0:2] = prev_contexts[:, 0:2]
+        ext_contexts[:, 5] = prev_contexts[:, 2]  # click_density
+        ext_contexts[:, 6] = prev_contexts[:, 3]  # avg_dt_scaled
+        ext_contexts[:, 7] = np.hypot(prev_contexts[:, 0], prev_contexts[:, 1])  # momentum_mag
 
-            if i > 0:
-                prev_tgt = start_targets[i - 1, 2:4]
-                curr_start = start_targets[i, 0:2]
-                dx_jump = curr_start[0] - prev_tgt[0]
-                dy_jump = curr_start[1] - prev_tgt[1]
-                dt_dwell = 0.15  # Default idle cognitive pause (scaled)
-            else:
-                dx_jump, dy_jump = 0.0, 0.0
-                dt_dwell = 0.1
-
-            momentum_mag = float(np.hypot(vx0, vy0))
-
-            ext_contexts[i] = [
-                vx0,
-                vy0,
-                dt_dwell,
-                dx_jump,
-                dy_jump,
-                click_density,
-                avg_dt,
-                momentum_mag
-            ]
+        # Inter-episode jump and cognitive dwell handoff
+        if N > 1:
+            ext_contexts[1:, 3:5] = start_targets[1:, 0:2] - start_targets[:-1, 2:4]
+            ext_contexts[1:, 2] = 0.15  # Default idle cognitive pause (scaled)
+        if N > 0:
+            ext_contexts[0, 2] = 0.1   # Initial resting dwell
 
         self.start_positions = torch.from_numpy(start_targets[:, :2]).float()
         self.target_positions = torch.from_numpy(start_targets[:, 2:]).float()
@@ -415,42 +423,80 @@ class KinematicBioLoss(nn.Module):
 
 def run_pilot_training(
     dataset_path: str = "data/mouse_dataset_fixed_N256_full.npz",
-    subset_size: int = 6000,
+    subset_size: Optional[int] = 6000,
+    full: bool = False,
+    max_episodes: Optional[int] = None,
+    train_split: float = 0.85,
+    num_workers: int = 0,
     epochs: int = 6,
     batch_size: int = 64,
     lr: float = 1e-3,
     save_path: str = "models/pilot_mouse_model.pth"
 ):
     print("\n==========================================================================")
-    print(" 🔬 INITIATING PILOT TRAINING: EXTENDED MOTION HISTORY CONTEXT")
-    print(f" Subset Size: {subset_size} episodes | Epochs: {epochs} | Batch Size: {batch_size}")
+    if full:
+        print(" 🚀 INITIATING PRODUCTION TRAINING: FULL 53K DATASET WITH KINEMATIC MEMORY")
+    else:
+        print(" 🔬 INITIATING PILOT TRAINING: EXTENDED MOTION HISTORY CONTEXT")
+    print(f" Mode: {'Full Dataset (All Episodes)' if full else f'Subset ({max_episodes or subset_size} episodes)'} | Epochs: {epochs} | Batch Size: {batch_size}")
     print("==========================================================================\n")
 
     # Select optimal device and threads
-    if torch.cuda.is_available():
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
         device = torch.device("cuda")
         print(f"[Device] Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        torch.backends.cudnn.benchmark = True
     else:
         device = torch.device("cpu")
         num_threads = min(8, os.cpu_count() or 4)
         torch.set_num_threads(num_threads)
         print(f"[Device] Using CPU with {num_threads} execution threads.")
 
-    # Load and split pilot dataset
-    full_pilot_dataset = PilotKinematicDataset(dataset_path, subset_size=subset_size)
-    total_len = len(full_pilot_dataset)
-    train_len = int(0.85 * total_len)
+    # Load dataset (full or subset)
+    effective_subset = None if full else (max_episodes if max_episodes is not None else subset_size)
+    dataset = PilotKinematicDataset(
+        dataset_path,
+        subset_size=effective_subset,
+        full_dataset=full,
+        max_episodes=max_episodes
+    )
+    total_len = len(dataset)
+    train_len = int(train_split * total_len)
     val_len = total_len - train_len
 
+    if full or total_len >= 50000:
+        print(f"[Dataset] Full training mode enabled: using all {total_len:,} episodes (Train: {train_len:,}, Val: {val_len:,})")
+    print(f"[Split] Train Set: {train_len:,} episodes ({train_split*100:.0f}%) | Validation Set: {val_len:,} episodes ({(1-train_split)*100:.0f}%)")
+
     train_set, val_set = torch.utils.data.random_split(
-        full_pilot_dataset,
+        dataset,
         [train_len, val_len],
         generator=torch.Generator().manual_seed(42)
     )
-    print(f"[Split] Train Set: {train_len} episodes | Validation Set: {val_len} episodes")
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    # GPU DataLoader throughput optimization: pin_memory and multi-process workers
+    pin_memory = use_cuda
+    loader_workers = max(0, num_workers)
+    print(f"[DataLoader] Configuration: num_workers={loader_workers}, pin_memory={pin_memory}, batch_size={batch_size}")
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=loader_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(loader_workers > 0)
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=loader_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(loader_workers > 0)
+    )
 
     # Initialize model
     model = MemoryConditionedMouseGenerator(
@@ -708,24 +754,42 @@ def evaluate_kinematic_memory(model: nn.Module, device: torch.device):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Pilot Training Script with Kinematic Memory")
-    parser.add_argument("--data", type=str, default="data/mouse_dataset_fixed_N256_full.npz")
-    parser.add_argument("--subset", type=int, default=6000, help="Subset size of episodes")
-    parser.add_argument("--epochs", type=int, default=6, help="Number of pilot epochs")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--save_path", type=str, default="models/pilot_mouse_model.pth")
+    parser = argparse.ArgumentParser(description="AI Natural Mouse Trajectory Engine - Pilot & Production Training")
+    parser.add_argument("--data", type=str, default="data/mouse_dataset_fixed_N256_full.npz", help="Path to preprocessed dataset (.npz)")
+    parser.add_argument("--full", action="store_true", help="Train on the ENTIRE dataset (all 53k episodes) without subsampling")
+    parser.add_argument("--max_episodes", type=int, default=None, help="Explicit maximum number of episodes to train on (overrides --subset)")
+    parser.add_argument("--subset", type=int, default=6000, help="Pilot subset size when --full is not specified (default: 6000)")
+    parser.add_argument("--train_split", type=float, default=0.85, help="Train/Validation split ratio (default: 0.85)")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of DataLoader worker processes for fast GPU ingestion (default: 2)")
+    parser.add_argument("--epochs", type=int, default=6, help="Number of training epochs (default: 6)")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size (default: 64)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate (default: 0.001)")
+    parser.add_argument("--save_path", type=str, default=None, help="Output checkpoint path (default: models/production_mouse_model.pth if --full else models/pilot_mouse_model.pth)")
 
     args = parser.parse_args()
+
+    # Determine default save path based on training mode
+    if args.save_path is None:
+        if args.full:
+            effective_save_path = "models/production_mouse_model.pth"
+        else:
+            effective_save_path = "models/pilot_mouse_model.pth"
+    else:
+        effective_save_path = args.save_path
 
     trained_model, saved_path = run_pilot_training(
         dataset_path=args.data,
         subset_size=args.subset,
+        full=args.full,
+        max_episodes=args.max_episodes,
+        train_split=args.train_split,
+        num_workers=args.num_workers,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        save_path=args.save_path
+        save_path=effective_save_path
     )
 
     device = next(trained_model.parameters()).device
     evaluate_kinematic_memory(trained_model, device)
+
