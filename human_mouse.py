@@ -666,26 +666,25 @@ class HumanMouseSimulator:
                 trajectory[step_k]['x'] = p0_x + (trajectory[step_k]['x'] - p0_x) * w
                 trajectory[step_k]['y'] = p0_y + (trajectory[step_k]['y'] - p0_y) * w
 
-        # Case 2: Waypoint Momentum Bleed (Jerk-Free Transition)
+        # Case 2: Waypoint Momentum Bleed & Symmetrized Relaunch
         # At waypoint transitions (momentum chaining with v_residual_mag > 15.0 px/s), smoothly fade out
-        # residual inflow momentum using a cosine envelope over the transition steps so no sudden oscillation
-        # occurs. Guarantees C^2 continuity and eliminates vertical acceleration spikes.
-        elif v_residual_mag > 15.0 and len(trajectory) >= 12:
-            K_blend = min(8, len(trajectory) - 2)
-            orig_pts = [(p['x'], p['y']) for p in trajectory[:K_blend + 1]]
+        # residual inflow momentum using a cosine envelope while modulating newly directed departure velocity
+        # over K_trans = 10 to 14 steps (~40-60 ms) so acceleration rises symmetrically to Point A.
+        elif v_residual_mag > 15.0 and len(trajectory) >= 16:
+            K_trans = min(12, len(trajectory) - 2)
+            orig_pts = [(p['x'], p['y']) for p in trajectory[:K_trans + 1]]
 
-            for step_i in range(1, K_blend + 1):
-                tau = step_i / float(K_blend + 1)
-                # Cosine fade envelope: smoothly bleeds out residual inflow momentum
+            v_mod_xs = [(orig_pts[i][0] - orig_pts[i-1][0]) / max(0.007, trajectory[i]['dt_ms'] / 1000.0) for i in range(1, K_trans + 1)]
+            v_mod_ys = [(orig_pts[i][1] - orig_pts[i-1][1]) / max(0.007, trajectory[i]['dt_ms'] / 1000.0) for i in range(1, K_trans + 1)]
+
+            for step_i in range(1, K_trans + 1):
+                tau = step_i / float(K_trans)
+                w = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
                 fade = 0.5 * (1.0 + math.cos(math.pi * tau))
-                engage = 1.0 - fade
 
                 dt_i = max(0.007, trajectory[step_i]['dt_ms'] / 1000.0)
-                v_model_x = (orig_pts[step_i][0] - orig_pts[step_i - 1][0]) / dt_i
-                v_model_y = (orig_pts[step_i][1] - orig_pts[step_i - 1][1]) / dt_i
-
-                v_blended_x = fade * vx_residual + engage * v_model_x
-                v_blended_y = fade * vy_residual + engage * v_model_y
+                v_blended_x = fade * vx_residual + (1.0 - fade) * v_mod_xs[step_i - 1] * w
+                v_blended_y = fade * vy_residual + (1.0 - fade) * v_mod_ys[step_i - 1] * w
 
                 new_x = trajectory[step_i - 1]['x'] + v_blended_x * dt_i
                 new_y = trajectory[step_i - 1]['y'] + v_blended_y * dt_i
@@ -694,11 +693,11 @@ class HumanMouseSimulator:
                 trajectory[step_i]['y'] = float(new_y)
 
             # Feather coordinate offset smoothly across subsequent steps to prevent trajectory drift
-            delta_x = trajectory[K_blend]['x'] - orig_pts[K_blend][0]
-            delta_y = trajectory[K_blend]['y'] - orig_pts[K_blend][1]
-            feather_steps = min(12, len(trajectory) - 1 - K_blend)
+            delta_x = trajectory[K_trans]['x'] - orig_pts[K_trans][0]
+            delta_y = trajectory[K_trans]['y'] - orig_pts[K_trans][1]
+            feather_steps = min(14, len(trajectory) - 1 - K_trans)
             for j in range(1, feather_steps + 1):
-                idx = K_blend + j
+                idx = K_trans + j
                 decay = 1.0 - (j / float(feather_steps + 1))
                 trajectory[idx]['x'] += delta_x * decay
                 trajectory[idx]['y'] += delta_y * decay
@@ -753,7 +752,7 @@ class HumanMouse:
         return self.apply_biomechanical_kinematic_filter(raw_traj, incoming_velocity=in_vel)
 
     @staticmethod
-    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=None, max_velocity=None, max_acceleration=20000.0, min_dt_ms=7.0, split_idx=None, incoming_velocity=None):
+    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=None, max_velocity=None, max_acceleration=15000.0, min_dt_ms=7.0, split_idx=None, incoming_velocity=None):
         """
         Global Biomechanical Safety Filter.
         Enforces continuous physiological constraints across single or multi-segment paths:
@@ -763,15 +762,14 @@ class HumanMouse:
           3. Neuromuscular Onset Inertia (Smoothstep / Cubic Ramp):
              For movements initiated from rest, modulates early displacements by w(t) = 3(t/K)^2 - 2(t/K)^3
              over the initial K_ramp steps (~30-50 ms), building acceleration smoothly from zero.
-          4. Waypoint Transition Momentum Blending:
+          4. Waypoint Transition Momentum Blending & Symmetrized Relaunch:
              When chained across waypoints (split_idx provided), applies a cosine/smoothstep blend
-             to the incoming residual velocity over the secondary segment onset, eliminating vertical jerk spikes.
+             over K_trans = 10 to 14 steps (~40-60 ms), symmetrizing departing acceleration with Point A.
           5. Distance-Adaptive Peak Velocity Rescaling (Soft Elastic Cap):
              Calculates biologically plausible peak velocity V_max(D) = V_base + alpha * sqrt(D)
              (V_base ~ 800 px/s, softly guided between 1500 and 2300 px/s).
-             Smoothly rescales velocity profile via soft algebraic compression:
-             v_sat = v_raw / (1 + (v_raw / V_max)^4)^(1/4), preserving bell-curve geometry without plateaus.
-          6. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration (default 20,000 px/s^2).
+             Smoothly rescales velocity profile via soft algebraic compression, preserving bell-curve geometry.
+          6. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration (default 15,000 px/s^2, effective <= 13,800 px/s^2).
         """
         if not trajectory or len(trajectory) < 3:
             return trajectory
@@ -813,30 +811,29 @@ class HumanMouse:
                 s_xs[t] = p0_x + (s_xs[t] - p0_x) * w
                 s_ys[t] = p0_y + (s_ys[t] - p0_y) * w
 
-        # 4. Waypoint Transition Momentum Bleed (Multi-Segment Jerk-Free Transition)
-        if split_idx is not None and 0 < split_idx < N - 10:
-            K_blend = min(8, N - 1 - split_idx)
+        # 4. Waypoint Transition Momentum Bleed & Symmetrized Relaunch
+        if split_idx is not None and 0 < split_idx < N - 14:
+            K_trans = min(12, N - 1 - split_idx)
             dt_pre = max(min_dt_ms, out[split_idx]['dt_ms']) / 1000.0
             v_arr_x = (s_xs[split_idx] - s_xs[split_idx - 1]) / dt_pre
             v_arr_y = (s_ys[split_idx] - s_ys[split_idx - 1]) / dt_pre
 
             curr_x, curr_y = s_xs[split_idx], s_ys[split_idx]
-            orig_seg2_x = s_xs[split_idx:split_idx + K_blend + 1].copy()
-            orig_seg2_y = s_ys[split_idx:split_idx + K_blend + 1].copy()
+            orig_seg2_x = s_xs[split_idx:split_idx + K_trans + 1].copy()
+            orig_seg2_y = s_ys[split_idx:split_idx + K_trans + 1].copy()
 
-            for step_i in range(1, K_blend + 1):
+            v_mod_xs = [(orig_seg2_x[i] - orig_seg2_x[i-1]) / (max(min_dt_ms, out[split_idx + i]['dt_ms']) / 1000.0) for i in range(1, K_trans + 1)]
+            v_mod_ys = [(orig_seg2_y[i] - orig_seg2_y[i-1]) / (max(min_dt_ms, out[split_idx + i]['dt_ms']) / 1000.0) for i in range(1, K_trans + 1)]
+
+            for step_i in range(1, K_trans + 1):
                 idx = split_idx + step_i
-                tau = step_i / float(K_blend + 1)
-                # Cosine fade envelope: smoothly bleeds out residual inflow momentum
+                tau = step_i / float(K_trans)
+                w = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
                 fade = 0.5 * (1.0 + math.cos(math.pi * tau))
-                engage = 1.0 - fade
                 dt_i = max(min_dt_ms, out[idx]['dt_ms']) / 1000.0
 
-                v_mod_x = (orig_seg2_x[step_i] - orig_seg2_x[step_i - 1]) / dt_i
-                v_mod_y = (orig_seg2_y[step_i] - orig_seg2_y[step_i - 1]) / dt_i
-
-                v_blend_x = fade * v_arr_x + engage * v_mod_x
-                v_blend_y = fade * v_arr_y + engage * v_mod_y
+                v_blend_x = fade * v_arr_x + (1.0 - fade) * v_mod_xs[step_i - 1] * w
+                v_blend_y = fade * v_arr_y + (1.0 - fade) * v_mod_ys[step_i - 1] * w
 
                 curr_x += v_blend_x * dt_i
                 curr_y += v_blend_y * dt_i
@@ -844,13 +841,13 @@ class HumanMouse:
                 s_ys[idx] = curr_y
 
             # Feather coordinate difference smoothly over next downstream steps
-            delta_x = s_xs[split_idx + K_blend] - orig_seg2_x[-1]
-            delta_y = s_ys[split_idx + K_blend] - orig_seg2_y[-1]
-            feather_steps = min(12, N - 1 - (split_idx + K_blend))
+            delta_x = s_xs[split_idx + K_trans] - orig_seg2_x[-1]
+            delta_y = s_ys[split_idx + K_trans] - orig_seg2_y[-1]
+            feather_steps = min(14, N - 1 - (split_idx + K_trans))
             for j in range(1, feather_steps + 1):
                 decay = 1.0 - (j / float(feather_steps + 1))
-                s_xs[split_idx + K_blend + j] += delta_x * decay
-                s_ys[split_idx + K_blend + j] += delta_y * decay
+                s_xs[split_idx + K_trans + j] += delta_x * decay
+                s_ys[split_idx + K_trans + j] += delta_y * decay
 
         for i in range(N):
             out[i]['x'] = s_xs[i]
@@ -880,7 +877,8 @@ class HumanMouse:
         dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / np.maximum(1e-4, v_scaled))
 
         # 6. Dynamic Forward-Backward Acceleration Limiting
-        effective_a_max = max_acceleration * 0.90
+        # Bounded within physiological desktop human acceleration envelope (~12,000 to 14,000 px/s^2)
+        effective_a_max = min(13800.0, max_acceleration * 0.90)
 
         for i in range(len(v_scaled)):
             if dists[i] < 0.1:

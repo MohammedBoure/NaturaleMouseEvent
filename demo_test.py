@@ -271,7 +271,7 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     combined_raw = traj1_chain + traj2[1:]
     split_idx = len(traj1_chain) - 1
     combined_traj = mouse.apply_biomechanical_kinematic_filter(
-        combined_raw, max_acceleration=20000.0, min_dt_ms=7.0, split_idx=split_idx
+        combined_raw, max_acceleration=15000.0, min_dt_ms=7.0, split_idx=split_idx
     )
 
     xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float64)
