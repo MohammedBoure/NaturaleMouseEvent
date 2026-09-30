@@ -2,7 +2,7 @@
 
 An AI-powered natural human mouse trajectory generation and execution engine built with **PyTorch** and **PyAutoGUI**. 
 
-This package generates realistic, human-like mouse movements using trained neural networks and advanced biomechanical kinematic shaping. It eliminates robotic straight-line cursor movements by introducing natural micro-variations, distance-adaptive peak velocity scaling (soft elastic cap), smoothstep neuromuscular onset inertia ($w(t) = 3(t/K)^2 - 2(t/K)^3$), jerk-free cosine waypoint momentum blending, continuous Savitzky-Golay coordinate smoothing, 8-12 Hz neuromuscular physiological tremor, and a Windows 1ms multimedia timer loop with sub-millisecond execution precision.
+This package generates realistic, human-like mouse movements using trained neural networks and advanced biomechanical kinematic shaping. It eliminates robotic straight-line cursor movements by introducing natural micro-variations, global proportional bell rescaling ($V_{\text{target\_max}}(D) = \operatorname{clip}(V_{\text{base}} + \alpha \sqrt{D}, 1600.0, 2300.0)$), neuromuscular onset inertia with quintic smoothstep ramp ($w(t) = 6\tau^5 - 15\tau^4 + 10\tau^3$), jerk-free cosine waypoint momentum blending, continuous Savitzky-Golay coordinate smoothing, 8-12 Hz neuromuscular physiological tremor, and a Windows 1ms multimedia timer loop with sub-millisecond execution precision.
 
 ---
 
