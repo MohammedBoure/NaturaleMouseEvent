@@ -770,6 +770,9 @@ class HumanMouse:
              (V_base ~ 800 px/s, softly guided between 1500 and 2300 px/s).
              Smoothly rescales velocity profile via soft algebraic compression, preserving bell-curve geometry.
           6. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration (default 15,000 px/s^2, effective <= 13,800 px/s^2).
+          7. Acceleration-to-Deceleration Transition Shaping (Hann Relaxation Window):
+             Applies a Hann/cosine smoothing window (K_relax = 7 steps) across the acceleration cutoff
+             at peak velocity and braking onset, ensuring continuous, finite da/dt (Jerk continuity).
         """
         if not trajectory or len(trajectory) < 3:
             return trajectory
@@ -911,6 +914,22 @@ class HumanMouse:
                     v_scaled[i] = max_allowed_v
                     if v_scaled[i] > 1e-4:
                         dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_scaled[i])
+
+        # 7. Acceleration-to-Deceleration Transition Shaping (Hann Relaxation Window)
+        # Smooths discrete acceleration cutoff at peak velocity and transition into braking,
+        # ensuring continuous, finite da/dt (Jerk continuity) across drive-to-deceleration inflection.
+        if N >= 15:
+            K_relax = 7
+            hann_kernel = np.hanning(K_relax)
+            hann_kernel /= np.sum(hann_kernel)
+            half_k = K_relax // 2
+
+            v_smoothed = np.convolve(v_scaled, hann_kernel, mode='same')
+            v_scaled[half_k : -half_k] = v_smoothed[half_k : -half_k]
+
+            for i in range(len(v_scaled)):
+                if v_scaled[i] > 1e-4:
+                    dt_clamped[i] = max(min_dt_ms / 1000.0, dists[i] / v_scaled[i])
 
         # Re-apply updated dt_ms smoothly
         for i in range(1, N):
