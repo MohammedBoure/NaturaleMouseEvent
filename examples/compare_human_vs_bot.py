@@ -9,8 +9,18 @@ if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+ENGINE_DIR = os.path.join(REPO_ROOT, "human_mouse_engine")
+if ENGINE_DIR not in sys.path:
+    sys.path.insert(0, ENGINE_DIR)
 
-from human_mouse import HumanMouse
+try:
+    from human_mouse_engine import HumanMouse
+except ImportError:
+    from human_mouse import HumanMouse
 
 def generate_comparison_plots():
     mouse = HumanMouse()
@@ -63,7 +73,8 @@ def generate_comparison_plots():
     ax2.grid(True, linestyle=':', alpha=0.6)
     ax2.legend(loc='upper right')
 
-    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "human_vs_bot_comparison.png")
+    output_path = os.path.join(REPO_ROOT, "docs", "human_vs_bot_comparison.png")
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()

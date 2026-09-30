@@ -290,24 +290,28 @@ class HumanMouseSimulator:
         # 4. human_mouse_model.pt
         resolved_path = None
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(script_dir)
 
         candidate_paths = []
         if model_path:
             candidate_paths.extend([
                 model_path,
-                os.path.join(script_dir, model_path)
+                os.path.join(script_dir, model_path),
+                os.path.join(parent_dir, model_path)
             ])
         candidate_paths.extend([
             "models/production_mouse_model.pth",
-            os.path.join(script_dir, "models/production_mouse_model.pth"),
+            os.path.join(parent_dir, "models", "production_mouse_model.pth"),
+            os.path.join(script_dir, "models", "production_mouse_model.pth"),
             "models/pilot_mouse_model.pth",
-            os.path.join(script_dir, "models/pilot_mouse_model.pth"),
-            "best_model.pth",
-            os.path.join(script_dir, "best_model.pth"),
-            "human_mouse_model.pt",
+            os.path.join(parent_dir, "models", "pilot_mouse_model.pth"),
+            os.path.join(script_dir, "models", "pilot_mouse_model.pth"),
+            "models/best_model.pth",
+            os.path.join(parent_dir, "models", "best_model.pth"),
+            "models/human_mouse_model.pt",
+            os.path.join(parent_dir, "models", "human_mouse_model.pt"),
             os.path.join(script_dir, "human_mouse_model.pt"),
-            "human_mouse_engine/human_mouse_model.pt",
-            os.path.join(script_dir, "human_mouse_engine/human_mouse_model.pt")
+            os.path.join(script_dir, "human_mouse_engine", "human_mouse_model.pt")
         ])
 
         for p in candidate_paths:

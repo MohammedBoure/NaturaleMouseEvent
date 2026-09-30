@@ -32,11 +32,15 @@ ENV/
 *.db
 *.npz
 
-# Generated Plots & Images
+# Generated Plots & Images (allow documentation images in docs/)
 *.png
 *.jpg
 *.jpeg
 *.svg
+!docs/*.png
+!docs/*.jpg
+!docs/*.jpeg
+!docs/*.svg
 
 # Log files
 *.log
@@ -50,6 +54,6 @@ ENV/
 Thumbs.db
 
 # Exceptions: Preserve trained PyTorch model weights
-!human_mouse_model.pt
-!human_mouse_engine/human_mouse_model.pt
-!best_model.pth
+!models/*.pth
+!models/*.pt
+!human_mouse_engine/*.pt

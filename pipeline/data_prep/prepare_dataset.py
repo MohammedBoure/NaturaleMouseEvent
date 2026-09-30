@@ -236,8 +236,12 @@ def prepare_dataset(data_dir, max_len=256, min_len=3, output_dir=None):
     return json_summary
 
 if __name__ == '__main__':
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+    default_data = os.path.join(REPO_ROOT, "data")
+
     parser = argparse.ArgumentParser(description="Full Dataset Preprocessor for Mouse Event AI")
-    parser.add_argument("--data_dir", type=str, default=r"c:\Users\moham\Desktop\ai\naturale_mouse_event\data", help="Directory containing .sqlite3 files")
+    parser.add_argument("--data_dir", type=str, default=default_data, help="Directory containing .sqlite3 files")
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--min_len", type=int, default=3)
     args = parser.parse_args()

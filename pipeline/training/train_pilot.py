@@ -838,8 +838,12 @@ def evaluate_kinematic_memory(model: nn.Module, device: torch.device):
 
 
 if __name__ == '__main__':
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+    default_data = os.path.join(REPO_ROOT, "data", "mouse_dataset_fixed_N256_full.npz")
+
     parser = argparse.ArgumentParser(description="AI Natural Mouse Trajectory Engine - Pilot & Production Training")
-    parser.add_argument("--data", type=str, default="data/mouse_dataset_fixed_N256_full.npz", help="Path to preprocessed dataset (.npz)")
+    parser.add_argument("--data", type=str, default=default_data, help="Path to preprocessed dataset (.npz)")
     parser.add_argument("--full", action="store_true", help="Train on the ENTIRE dataset (all 53k episodes) without subsampling")
     parser.add_argument("--max_episodes", type=int, default=None, help="Explicit maximum number of episodes to train on (overrides --subset)")
     parser.add_argument("--subset", type=int, default=6000, help="Pilot subset size when --full is not specified (default: 6000)")
@@ -856,11 +860,13 @@ if __name__ == '__main__':
     # Determine default save path based on training mode
     if args.save_path is None:
         if args.full:
-            effective_save_path = "models/production_mouse_model.pth"
+            effective_save_path = os.path.join(REPO_ROOT, "models", "production_mouse_model.pth")
         else:
-            effective_save_path = "models/pilot_mouse_model.pth"
+            effective_save_path = os.path.join(REPO_ROOT, "models", "pilot_mouse_model.pth")
     else:
         effective_save_path = args.save_path
+
+    os.makedirs(os.path.dirname(os.path.abspath(effective_save_path)), exist_ok=True)
 
     trained_model, saved_path = run_pilot_training(
         dataset_path=args.data,

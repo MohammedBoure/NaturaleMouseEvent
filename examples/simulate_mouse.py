@@ -2,15 +2,22 @@ import os
 import sys
 import numpy as np
 import torch
-from human_mouse import HumanMouseSimulator
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+ENGINE_DIR = os.path.join(REPO_ROOT, "human_mouse_engine")
+if ENGINE_DIR not in sys.path:
+    sys.path.insert(0, ENGINE_DIR)
+
+try:
+    from human_mouse_engine import HumanMouseSimulator
+except ImportError:
+    from human_mouse import HumanMouseSimulator
 
 if __name__ == '__main__':
     print("\n--- AI Natural Mouse Trajectory Simulation Test ---")
-    model_file = "human_mouse_model.pt"
-    if not os.path.exists(model_file) and os.path.exists("best_model.pth"):
-        model_file = "best_model.pth"
-
-    sim = HumanMouseSimulator(model_path=model_file)
+    sim = HumanMouseSimulator()
     start_pos = (100, 100)
     target_pos = (800, 500)
     print(f"Simulating movement: {start_pos} -> {target_pos}")

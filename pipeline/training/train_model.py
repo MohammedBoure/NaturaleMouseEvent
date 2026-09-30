@@ -751,6 +751,12 @@ def evaluate(
 # =====================================================================
 
 def main():
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+    default_data = os.path.join(REPO_ROOT, "data", "mouse_dataset_fixed_N256_full.npz")
+    default_save = os.path.join(REPO_ROOT, "models", "best_model.pth")
+    default_legacy = os.path.join(REPO_ROOT, "models", "human_mouse_model.pt")
+
     parser = argparse.ArgumentParser(
         description="Production PyTorch Training Script for AI Natural Human Mouse Kinematic Generator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -758,7 +764,7 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="data/mouse_dataset_fixed_N256_full.npz",
+        default=default_data,
         help="Path to preprocessed .npz trajectory dataset"
     )
     parser.add_argument("--epochs", type=int, default=40, help="Number of training epochs")
@@ -773,12 +779,17 @@ def main():
     parser.add_argument("--tf_end", type=float, default=0.1, help="Final Teacher Forcing ratio (Scheduled Sampling)")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Max gradient norm clipping threshold")
     parser.add_argument("--val_split", type=float, default=0.2, help="Validation dataset split ratio")
-    parser.add_argument("--save_path", type=str, default="best_model.pth", help="Filepath for saving the best model checkpoint")
-    parser.add_argument("--legacy_weights", type=str, default="human_mouse_model.pt", help="Secondary weights file path for engine compatibility")
+    parser.add_argument("--save_path", type=str, default=default_save, help="Filepath for saving the best model checkpoint")
+    parser.add_argument("--legacy_weights", type=str, default=default_legacy, help="Secondary weights file path for engine compatibility")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--device", type=str, default="auto", help="Device selector: auto, cuda, mps, cpu")
 
     args = parser.parse_args()
+
+    # Ensure parent directories exist
+    os.makedirs(os.path.dirname(os.path.abspath(args.save_path)), exist_ok=True)
+    if args.legacy_weights:
+        os.makedirs(os.path.dirname(os.path.abspath(args.legacy_weights)), exist_ok=True)
 
     # Set deterministic seeds
     set_seed(args.seed)

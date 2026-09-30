@@ -1,6 +1,22 @@
-import numpy as np
+import os
+import sys
 
-data = np.load('mouse_dataset_fixed_N256.npz')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+dataset_candidates = [
+    sys.argv[1] if len(sys.argv) > 1 else None,
+    os.path.join(REPO_ROOT, "data", "mouse_dataset_fixed_N256_full.npz"),
+    "data/mouse_dataset_fixed_N256_full.npz",
+    os.path.join(REPO_ROOT, "data", "mouse_dataset_fixed_N256.npz"),
+    "mouse_dataset_fixed_N256.npz"
+]
+dataset_path = next((p for p in dataset_candidates if p and os.path.exists(p)), None)
+if not dataset_path:
+    print("Error: Could not locate dataset .npz file.")
+    sys.exit(1)
+
+data = np.load(dataset_path)
 masks = data['padding_masks'].astype(bool)
 seqs = data['seq_tensors']
 dts = []

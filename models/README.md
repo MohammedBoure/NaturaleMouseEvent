@@ -28,3 +28,11 @@ This directory stores trained PyTorch neural network checkpoints, weights, and e
 - **Split**: 85/15 stratified train/val split (45,073 train / 7,955 validation episodes).
 - **Execution**: Run with `--full` on GPU (`pin_memory=True`, `num_workers=4`). Auto-discovered by `HumanMouse` API and CLI utilities with top priority.
 
+### 3. `best_model.pth`
+- **Architecture**: `HumanMouseGenerator` checkpoint trained via baseline multi-objective training pipeline (`pipeline/training/train_model.py`).
+- **Features**: Includes model state dict, optimizer state, scheduler state, and configuration dictionary for training resumption or offline analysis.
+
+### 4. `human_mouse_model.pt`
+- **Architecture**: Compact legacy / PyTorch checkpoint containing model state dict and evaluation validation metrics for lightweight deployment.
+
+

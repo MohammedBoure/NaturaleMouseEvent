@@ -1,8 +1,12 @@
 import sqlite3
 import os
 import glob
+import sys
 
-data_dir = r"c:\Users\moham\Desktop\ai\naturale_mouse_event\data"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+data_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO_ROOT, "data")
 db_files = glob.glob(os.path.join(data_dir, "*.sqlite3"))
 
 total_events = 0

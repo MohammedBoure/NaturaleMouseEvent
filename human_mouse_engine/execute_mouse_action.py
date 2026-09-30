@@ -2,7 +2,10 @@ import argparse
 import sys
 import time
 import numpy as np
-from human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
+try:
+    from human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
+except ImportError:
+    from human_mouse_engine.human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
 
 if hasattr(sys.stdout, 'reconfigure'):
     try:

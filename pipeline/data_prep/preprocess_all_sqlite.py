@@ -505,9 +505,14 @@ def process_all_sqlite(
 
 
 if __name__ == '__main__':
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+    default_data = os.path.join(REPO_ROOT, "data")
+    default_output = os.path.join(REPO_ROOT, "data", "mouse_dataset_fixed_N256_full.npz")
+
     parser = argparse.ArgumentParser(description="Preprocess All SQLite Mouse Telemetry Databases")
-    parser.add_argument("--data_dir", type=str, default="./data", help="Directory containing .sqlite3 databases")
-    parser.add_argument("--output", type=str, default="data/mouse_dataset_fixed_N256_full.npz", help="Output .npz path")
+    parser.add_argument("--data_dir", type=str, default=default_data, help="Directory containing .sqlite3 databases")
+    parser.add_argument("--output", type=str, default=default_output, help="Output .npz path")
     parser.add_argument("--horizon", type=int, default=256, help="Fixed horizon length N")
     parser.add_argument("--min_steps", type=int, default=15, help="Minimum step count")
     parser.add_argument("--min_displacement", type=float, default=30.0, help="Minimum Euclidean displacement in px")

@@ -10,11 +10,12 @@ This package generates realistic, human-like mouse movements using trained neura
 
 ```
 human_mouse_engine/
-├── human_mouse_model.pt    # Pre-trained PyTorch Neural Network Weights
-├── human_mouse.py          # Self-Contained Python API Module (HumanMouse Class)
-├── execute_mouse_action.py # Command-Line (CLI) Executable Tool
-├── requirements.txt        # Python Dependencies List
-└── README.md               # Documentation & Usage Guide
+├── __init__.py             # Package Exports (HumanMouse, Simulator, Kinematic Filters)
+├── human_mouse.py          # Core AI Engine Module (HumanMouse & Biomechanical Shaping)
+├── execute_mouse_action.py # Standalone Command-Line (CLI) Executable Tool
+├── human_mouse_model.pt    # Embedded PyTorch Neural Network Weights
+├── requirements.txt        # Engine Python Dependencies List
+└── README.md               # Engine Documentation & Usage Guide
 ```
 
 ---

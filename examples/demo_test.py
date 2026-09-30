@@ -20,7 +20,18 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-from human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+ENGINE_DIR = os.path.join(REPO_ROOT, "human_mouse_engine")
+if ENGINE_DIR not in sys.path:
+    sys.path.insert(0, ENGINE_DIR)
+
+try:
+    from human_mouse_engine import HumanMouse, PYAUTOGUI_AVAILABLE
+except ImportError:
+    from human_mouse import HumanMouse, PYAUTOGUI_AVAILABLE
 
 try:
     import matplotlib
@@ -41,25 +52,32 @@ def print_banner():
 
 
 def resolve_model_path(cli_model: Optional[str] = None) -> Optional[str]:
-    """Resolves model checkpoint path with priority for pilot_mouse_model.pth."""
-    default_pilot = "models/pilot_mouse_model.pth"
+    """Resolves model checkpoint path with priority for production_mouse_model.pth or pilot_mouse_model.pth."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(script_dir, ".."))
 
     if cli_model:
-        candidates = [cli_model, os.path.join(script_dir, cli_model)]
+        candidates = [
+            cli_model,
+            os.path.join(repo_root, cli_model),
+            os.path.join(script_dir, cli_model)
+        ]
         for c in candidates:
             if os.path.exists(c):
                 return os.path.abspath(c)
         print(f"[Model Config] Warning: Specified checkpoint '{cli_model}' not found.")
-        print(f"[Model Config] Attempting fallback to default pilot model: {default_pilot}")
 
     # Check for models in priority order
     candidates = [
+        os.path.join(repo_root, "models", "production_mouse_model.pth"),
         "models/production_mouse_model.pth",
-        os.path.join(script_dir, "models/production_mouse_model.pth"),
-        default_pilot,
-        os.path.join(script_dir, default_pilot),
-        "best_model.pth",
+        os.path.join(repo_root, "models", "pilot_mouse_model.pth"),
+        "models/pilot_mouse_model.pth",
+        os.path.join(repo_root, "models", "best_model.pth"),
+        "models/best_model.pth",
+        os.path.join(repo_root, "models", "human_mouse_model.pt"),
+        os.path.join(repo_root, "human_mouse_engine", "human_mouse_model.pt"),
+        "models/human_mouse_model.pt",
         "human_mouse_model.pt"
     ]
     for c in candidates:
@@ -234,7 +252,7 @@ def run_idle_wandering_demo(mouse: HumanMouse):
     print("✅ Idle wandering completed!\n")
 
 
-def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_demo.png"):
+def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "docs/trajectory_demo.png"):
     """
     Generates a multi-segment Kinematic Momentum Chaining visualization plot:
     1. 2D Spatial Route: Segment 1 (A -> B) chained into Segment 2 (B -> C)
@@ -351,6 +369,9 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     ax3.grid(True, color='#30363d', linestyle=':', alpha=0.6)
     ax3.legend(loc='upper right', facecolor='#21262d', edgecolor='#30363d', labelcolor='white', fontsize=8.5)
 
+    out_dir = os.path.dirname(os.path.abspath(output_file))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     plt.tight_layout()
     plt.savefig(output_file, dpi=180, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close()
@@ -412,7 +433,7 @@ def main():
     parser.add_argument("--mode", type=str, choices=["dry-run", "live", "click", "wander", "plot", "all"],
                         help="Direct execution mode without interactive prompt")
     parser.add_argument("--trials", type=int, default=5, help="Number of trials for benchmark")
-    parser.add_argument("--plot-out", type=str, default="trajectory_demo.png", help="Output path for plot")
+    parser.add_argument("--plot-out", type=str, default="docs/trajectory_demo.png", help="Output path for plot")
 
     args = parser.parse_args()
 

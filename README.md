@@ -2,102 +2,145 @@
 
 An AI-powered system designed to generate biologically authentic, human-like mouse cursor trajectories and interactions using behavioral biometrics, kinematics modeling, and PyTorch.
 
-## Directory Structure & Files
+## Repository Architecture & Modular Layout
 
-- **`train_model.py`**: Production-grade PyTorch training pipeline implementing:
-  - `ConditioningEncoder`: Multi-layer perceptron encoding start/target positions, 4D momentum context, binary intent, and latent Gaussian noise ($z \in \mathbb{R}^{16}$) to produce initial hidden states $h_0$ and step-wise context conditioning.
-  - `KinematicDecoder`: 2-layer GRU with continuous context injection, bounded kinematics head (tanh-scaled displacement with $\le 0.05$ max step and sigmoid-scaled timing), and 4-class discrete action classification.
-  - `DistanceSmoothLoss`: Masked multi-objective loss combining Huber kinematics loss, target reach L1 penalty, jerk/smoothness regularizer (2nd-order differences), and Cross-Entropy action classification.
-  - Scheduled Sampling & Drift Stabilization: Decaying teacher forcing ratio ($1.0 \to 0.2$), screen boundary clamping, and padded-step freezing to completely eliminate autoregressive divergence during test rollouts.
-- **`human_mouse.py`**: Self-contained high-level Python API module providing the `HumanMouse` class:
-  - Fitts's Law Dynamic Step Allocation: Distance-adaptive step budgeting ($N_{\text{steps}} = \text{int}(N_{\text{base}} + k \cdot \log_2(1 + \text{dist} / W_{\text{ref}}))$) allowing short reaches (200–300 px) to complete faster (~250–350 ms, 35–45 steps) and long reaches (800–1200 px) to scale naturally (~550–750 ms, 65–85 steps).
-  - Natural Landing Phase & Box Dispersion: Decouples artificial 0.00 px robotic snapping, allowing authentic human terminal dispersion ($\sigma \approx 0.8\text{–}1.6\text{ px}$, average error ~1.5–2.5 px). Includes `sample_target_within_box(box_bounds)` for UI target selection via truncated 2D Gaussian ($\sigma = w/6, \sigma = h/6$).
-  - Symmetrized Waypoint Relaunch & Momentum Blending: At waypoint transitions (momentum chaining), blends transition inflow momentum and modulates departing acceleration over a broadened onset window ($K_{\text{trans}} = 10\text{--}14$ steps, ~40--60 ms) using a smoothstep envelope, guaranteeing $C^2$ continuity, eliminating vertical jerk spikes, and matching Point A's physiological rise profile.
-  - Hardware Polling Micro-Jitter (Live Execution Layer): Replaces rigid sleep timing in `_execute_trajectory` with stochastic USB HID micro-jitter ($\Delta t \sim \mathcal{N}(8.0\text{ ms}, 0.6\text{ ms})$ clamped to $[4.0, 12.0]\text{ ms}$) emulating real physical 125 Hz USB mouse polling and OS thread scheduling quanta.
-  - Global Biomechanical Safety Filter (`apply_biomechanical_kinematic_filter`): Enforces continuous Savitzky-Golay coordinate smoothing ($w=9, p=2$) with strict endpoint anchoring, Neuromuscular Onset Inertia quintic smoothstep ramp ($w(t) = 6\tau^5 - 15\tau^4 + 10\tau^3$ where $w'(0)=0, w''(0)=0$) building acceleration smoothly from zero, Global Proportional Bell Rescaling ($V_{\text{target\_max}}(D) = \operatorname{clip}(V_{\text{base}} + \alpha \sqrt{D}, 1600.0, 2300.0)$ with uniform scalar $s = V_{\text{target\_max}} / v_{\text{peak}}$) preserving 100% of the neural model's continuous bell-curve convexity ($d^2v/dt^2 \ne 0$) without flatline plateaus or zero-acceleration deadbands, hardware polling bounds ($\Delta t \ge 7.0\text{ ms}$), forward-backward physiological acceleration profiling ($|a| \le 14,000\text{ px/s}^2$), and Acceleration-to-Deceleration Transition Shaping (Hann Relaxation Window, $K_{\text{relax}} = 7$ steps) ensuring continuous, finite $\frac{da}{dt}$ (Jerk continuity) across drive-to-deceleration inflection.
-  - Directional Momentum Gating: Prevents acute retrograde hooks when incoming velocity opposes target direction (angle $\ge 90^\circ$).
-  - Normalized & Dwell-Decayed Momentum Handoff (`compute_terminal_momentum`): Bounded physiological handoff ($\|\mathbf{v}\| \le 1800\text{ px/s}$), screen dimension normalization, and exponential dwell dissipation ($\exp(-\Delta t_{\text{dwell}} / 0.08)$).
-  - Continuous 8–12 Hz Ornstein-Uhlenbeck (OU) physiological tremor with ballistic speed suppression.
-  - High-precision execution loop with Windows 1ms multimedia timer (`timeBeginPeriod`) and hybrid sleep-spinwait pacing.
-- **`execute_mouse_action.py`**: Command-line interface (CLI) to execute natural cursor movements, sequences, and dry-run simulations with reach error reporting.
-- **`preprocess_all_sqlite.py`**: Robust, memory-efficient data engineering pipeline that sequentially processes all SQLite telemetry databases (`data/*.sqlite3`), filters non-human / orthogonal grid artifacts, removes time anomalies, and exports unified training datasets (`data/mouse_dataset_fixed_N256_full.npz`).
-- **`prepare_dataset.py`**: Legacy preprocessor for individual session database conversions.
-- **`demo_test.py`**: Interactive demo and testing suite offering interactive terminal selection, dry-run statistical benchmarking, live on-screen waypoint navigation with Kinematic Momentum Chaining, precision clicking tests, idle wandering simulation, and kinematic trajectory visualization (`trajectory_demo.png`).
-- **`simulate_mouse.py`**: Offline visualizer and simulation script for evaluating model trajectories.
-- **`analyze_dur.py`**: Statistical analysis script measuring step time deltas ($\Delta t$) and episode duration distributions.
-- **`scan_dbs.py`**: Database scanner tool to inspect raw session event counts and sequence lengths across `.sqlite3` files.
-- **`train_pilot.py`**: Pilot training pipeline with Extended Motion History Context (Kinematic Memory):
-  - Integrates 8D inter-episode history context vector $[v_{x0}, v_{y0}, \Delta t_{\text{dwell}}, \Delta x_{\text{jump}}, \Delta y_{\text{jump}}, \text{click\_density}, \text{avg\_dt}, \|\mathbf{v}_0\|]$ to maintain biomechanical momentum continuity across sequential goals.
-  - Multi-objective `KinematicBioLoss` combining Smooth L1 kinematics, endpoint terminal reach, temporal cadence, discrete bio-jerk & total variation regularizer, boundary acceleration constraints ($\mathcal{L}_{\text{boundary}} = \|\Delta p_0 - \mathbf{v}_{\text{init}}\Delta t_0\|^2 + 0.5\|\Delta p_1 - \Delta p_0\|^2$), and Action Cross-Entropy.
-  - Initial 10-step smoothstep muscle recruitment ramp bounding acceleration strictly below $90,000\text{ px/s}^2$ from rest.
-- **`models/`**: Directory containing trained PyTorch neural network checkpoints (`pilot_mouse_model.pth`) and its [README.md](file:///D:/git/NaturaleMouseEvent/models/README.md).
-- **`data/`**: Data directory containing preprocessed trajectory datasets (`mouse_dataset_fixed_N256_full.npz`) and its [README.md](file:///D:/git/NaturaleMouseEvent/data/README.md).
-- **`requirements.txt`**: Complete list of Python project dependencies across model training, preprocessing, filtering, visualization, and live automation.
-- **`human_mouse_engine/`**: Standalone packaged engine module and CLI utilities with documentation.
-
-## Training the Model
-
-### Pilot Training with Kinematic Memory (Local Subset)
-Run the pilot training pipeline with 8D motion history context and bio-jerk regularization on a local subset:
-
-```bash
-python train_pilot.py --data data/mouse_dataset_fixed_N256_full.npz --subset 6000 --epochs 6 --batch_size 64 --save_path models/pilot_mouse_model.pth
+```
+NaturaleMouseEvent/
+├── human_mouse_engine/        # Standalone packaged AI engine & execution layer
+│   ├── __init__.py            # Package exports (HumanMouse, Simulator, Kinematics)
+│   ├── human_mouse.py         # Core API, GRU neural models & neuromuscular filtering
+│   ├── execute_mouse_action.py# Standalone CLI cursor controller
+│   ├── human_mouse_model.pt   # Embedded standalone model weights
+│   ├── requirements.txt       # Engine minimal dependencies
+│   └── README.md              # Engine documentation
+├── pipeline/                  # Data engineering & deep learning pipelines
+│   ├── data_prep/             # SQLite parsing, trajectory filtering & .npz export
+│   │   ├── preprocess_all_sqlite.py
+│   │   ├── prepare_dataset.py
+│   │   ├── scan_dbs.py
+│   │   ├── analyze_dur.py
+│   │   └── README.md
+│   ├── training/              # PyTorch model training pipelines
+│   │   ├── train_pilot.py     # Kinematic Memory & Production training (AMP FP16)
+│   │   ├── train_model.py     # Scheduled Sampling baseline training
+│   │   └── README.md
+│   └── README.md              # Pipeline architecture documentation
+├── examples/                  # Demonstration, benchmarking & visual test scripts
+│   ├── demo_test.py           # Full interactive CLI demo & benchmark suite
+│   ├── compare_human_vs_bot.py# Side-by-side human vs. bot trajectory comparison
+│   ├── simulate_mouse.py      # Standalone headless trajectory simulation
+│   └── README.md              # Examples documentation & usage guide
+├── models/                    # Trained PyTorch neural network checkpoints
+│   ├── production_mouse_model.pth # 100% full dataset trained checkpoint
+│   ├── pilot_mouse_model.pth      # 8D Kinematic Memory pilot checkpoint
+│   ├── best_model.pth             # Baseline scheduled sampling checkpoint
+│   ├── human_mouse_model.pt       # Compact deployment weights
+│   └── README.md                  # Model architecture specifications & benchmarks
+├── docs/                      # Visual artifacts & documentation assets
+│   ├── trajectory_demo.png        # Kinematic momentum chaining & acceleration plot
+│   ├── human_vs_bot_comparison.png# Spatial path & velocity profile comparison
+│   └── README.md                  # Documentation assets index
+├── data/                      # Telemetry databases & preprocessed tensors
+│   ├── mouse_dataset_fixed_N256_full.npz
+│   └── README.md                  # Dataset specifications & tensor schema
+└── requirements.txt           # Complete repository dependencies
 ```
 
-### Production Training (Full 53,028 Episodes on GPU / Colab T4)
-Train across 100% of the trajectory dataset with Kinematic Memory, Automatic Mixed Precision (`torch.amp` FP16 Tensor Cores), and pinned GPU memory:
+---
+
+## Key Features & Kinematics Modeling
+
+- **Biomechanical Kinematic Shaping (`apply_biomechanical_kinematic_filter`)**:
+  - *Savitzky-Golay Smoothing*: Continuous 2nd-order polynomial coordinate filtering ($w=9, p=2$) with strict endpoint anchoring.
+  - *Neuromuscular Onset Inertia*: Quintic smoothstep ramp ($w(\tau) = 6\tau^5 - 15\tau^4 + 10\tau^3$ where $w'(0)=0, w''(0)=0$) modeling arm muscle recruitment latency (~30–40 ms) from zero initial acceleration.
+  - *Global Proportional Bell Rescaling*: Distance-adaptive peak velocity ceiling ($V_{\text{target\_max}}(D) = \operatorname{clip}(V_{\text{base}} + \alpha \sqrt{D}, 1600.0, 2300.0)$) with uniform scalar scaling ($s = V_{\text{target\_max}} / v_{\text{peak}}$), preserving 100% of the neural model's continuous bell-curve convexity without artificial flatline velocity plateaus or zero-acceleration deadzones.
+  - *Waypoint Relaunch Acceleration Symmetry*: Smoothstep transition envelope across $K_{\text{trans}} = 10\text{--}14$ steps (~40–60 ms) matching the physiological rise base of initial onset and bounding transition peaks $\le 14,000\text{ px/s}^2$.
+  - *Acceleration Decay Relaxation*: Hann cosine decay window ($K_{\text{relax}} = 7$ steps) across drive-to-deceleration inflection ensuring unbroken $C^1$ continuity and finite jerk ($\frac{da}{dt}$).
+- **Fitts's Law Dynamic Step Allocation**: Distance-adaptive budgeting ($N_{\text{steps}} = \text{int}(N_{\text{base}} + k \cdot \log_2(1 + \text{dist} / W_{\text{ref}}))$) allowing short reaches (200–300 px) to complete naturally in ~250–350 ms and long reaches (800–1200 px) in ~550–750 ms.
+- **Natural Landing Phase & Box Dispersion**: Decouples artificial 0.00 px robotic snapping, allowing authentic human terminal dispersion ($\sigma \approx 0.8\text{–}1.6\text{ px}$, average error ~1.5–2.5 px). Includes `sample_target_within_box(box_bounds)` for UI target selection via truncated 2D Gaussian ($\sigma = w/6, \sigma = h/6$).
+- **Continuous 8–12 Hz Neuromuscular Tremor**: Ornstein-Uhlenbeck (OU) physiological micro-tremor process with ballistic speed suppression.
+- **Sub-Millisecond Execution Precision**: Windows 1ms multimedia timer (`timeBeginPeriod`) with hybrid sleep-spinwait pacing.
+
+---
+
+## Quick Start & Testing
+
+### 1. Interactive Demo & Statistical Benchmark
+
+Run the demo suite directly from the repository root:
 
 ```bash
-# Production training on all 53,028 episodes (90/10 split: 47,725 train / 5,303 val)
-# Auto-enables AMP (FP16), pin_memory=True, and in-memory direct indexing (num_workers=0)
-python train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 0 --save_path models/production_mouse_model.pth
+# Dry-run benchmark across varied screen distances (Momentum Chaining)
+python examples/demo_test.py --mode dry-run --model models/production_mouse_model.pth
 
-# Resume / Warm-Start from an existing checkpoint (e.g. continuing from Epoch 7 up to Epoch 12)
-python train_pilot.py --full --epochs 12 --batch_size 128 --num_workers 0 --resume models/production_mouse_model.pth --save_path models/production_mouse_model.pth
+# Generate & export multi-segment kinematic chained analysis (docs/trajectory_demo.png)
+python examples/demo_test.py --mode plot --model models/production_mouse_model.pth
 
-# Or train on a custom number of episodes (e.g., 25,000)
-python train_pilot.py --max_episodes 25000 --epochs 8 --batch_size 128 --num_workers 0
+# Live cursor test across 4 screen waypoints with dynamic curvature
+python examples/demo_test.py --mode live
+
+# Side-by-side comparative visualization (docs/human_vs_bot_comparison.png)
+python examples/compare_human_vs_bot.py
+
+# Offline lightweight simulation
+python examples/simulate_mouse.py
 ```
 
-### Full Legacy Model Training (Baseline Pipeline)
-Run the baseline training pipeline with default parameters:
+### 2. Standalone CLI Controller
+
+Execute natural cursor movements directly via `human_mouse_engine`:
 
 ```bash
-python train_model.py --epochs 40 --batch_size 64 --lr 0.001
+# Move to screen coordinate (800, 500) and click
+python human_mouse_engine/execute_mouse_action.py --x 800 --y 500 --click
+
+# Dry-run simulation mode (does not move physical mouse)
+python human_mouse_engine/execute_mouse_action.py --dry-run --x 500 --y 300
+
+# Continuous multi-target sequence
+python human_mouse_engine/execute_mouse_action.py --sequence "400,300;1200,200;900,600"
 ```
 
-Or with custom parameters and GPU acceleration:
+---
 
-```bash
-python train_model.py --data data/mouse_dataset_fixed_N256_full.npz --epochs 50 --batch_size 128 --hidden_dim 256 --noise_dim 16 --tf_start 1.0 --tf_end 0.2 --save_path best_model.pth
+## Python Programmatic API Usage
+
+Import `HumanMouse` from the `human_mouse_engine` package into any automation script:
+
+```python
+from human_mouse_engine import HumanMouse
+
+# Initialize engine (automatically discovers models/production_mouse_model.pth)
+mouse = HumanMouse()
+
+# Move cursor naturally to (800, 400)
+mouse.move_to(target_x=800, target_y=400)
+
+# Move and click
+mouse.click_at(target_x=1200, target_y=600, button='left')
+
+# Continuous sequence with automatic momentum chaining
+targets = [(400, 300), (900, 500), (600, 800)]
+mouse.move_sequence(targets, click_targets=False, delay_between=0.3)
 ```
 
-## Interactive Demo & Testing
+---
 
-Run the interactive test suite (defaults to `models/pilot_mouse_model.pth` with 8D Kinematic Momentum Chaining):
+## Model Training & Data Engineering
 
+### 1. Preprocessing Raw Telemetry Databases
+Convert raw SQLite telemetry into unified PyTorch tensors:
 ```bash
-python demo_test.py
+python pipeline/data_prep/preprocess_all_sqlite.py --data_dir data --output data/mouse_dataset_fixed_N256_full.npz
 ```
 
-Or execute direct automated modes:
-
+### 2. Production Training with Kinematic Memory (Full Dataset)
+Train across all 53,028 human episodes with Automatic Mixed Precision (`torch.amp` FP16) and direct in-memory indexing:
 ```bash
-# 1. Benchmark with Kinematic Momentum Chaining (Simulation only)
-python demo_test.py --mode dry-run --trials 5
+python pipeline/training/train_pilot.py --full --epochs 10 --batch_size 128 --num_workers 0 --save_path models/production_mouse_model.pth
+```
 
-# 2. Live cursor test across 4 screen waypoints with dynamic curvature
-python demo_test.py --mode live
-
-# 3. Specify custom model checkpoint
-python demo_test.py --mode live --model models/pilot_mouse_model.pth
-
-# 4. Precision navigation and click test
-python demo_test.py --mode click
-
-# 5. Natural idle wandering and micro-tremor test
-python demo_test.py --mode wander
-
-# 6. Generate and export multi-segment kinematic chained graph (trajectory_demo.png)
-python demo_test.py --mode plot
+### 3. Pilot Training (Local Subset)
+```bash
+python pipeline/training/train_pilot.py --data data/mouse_dataset_fixed_N256_full.npz --subset 6000 --epochs 6 --batch_size 64 --save_path models/pilot_mouse_model.pth
 ```
