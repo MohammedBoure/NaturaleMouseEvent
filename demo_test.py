@@ -258,11 +258,10 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
     traj1 = mouse.generate_trajectory(pt_a, pt_b, prev_context=None, intent=1.0)
     arr_momentum = mouse.compute_terminal_momentum(traj1, dwell_time_sec=0.04)
 
-    # Cleanly drop any trailing duplicate stationary resting step from traj1 at in-flight junction
-    if len(traj1) > 1 and np.hypot(traj1[-1]['x'] - traj1[-2]['x'], traj1[-1]['y'] - traj1[-2]['y']) < 0.1:
-        traj1_chain = traj1[:-1]
-    else:
-        traj1_chain = traj1
+    # Cleanly drop any trailing duplicate stationary resting steps from traj1 at in-flight junction
+    traj1_chain = traj1
+    while len(traj1_chain) > 2 and np.hypot(traj1_chain[-1]['x'] - traj1_chain[-2]['x'], traj1_chain[-1]['y'] - traj1_chain[-2]['y']) < 0.2:
+        traj1_chain = traj1_chain[:-1]
 
     # Segment 2: B -> C initialized with the arrival momentum from Segment 1
     actual_b = (float(traj1_chain[-1]['x']), float(traj1_chain[-1]['y']))
@@ -270,8 +269,9 @@ def run_trajectory_plot_demo(mouse: HumanMouse, output_file: str = "trajectory_d
 
     # Combine trajectories and apply global biomechanical safety filter across concatenated multi-segment path
     combined_raw = traj1_chain + traj2[1:]
+    split_idx = len(traj1_chain) - 1
     combined_traj = mouse.apply_biomechanical_kinematic_filter(
-        combined_raw, max_acceleration=45000.0, min_dt_ms=7.0
+        combined_raw, max_acceleration=20000.0, min_dt_ms=7.0, split_idx=split_idx
     )
 
     xs = np.array([pt['x'] for pt in combined_traj], dtype=np.float64)

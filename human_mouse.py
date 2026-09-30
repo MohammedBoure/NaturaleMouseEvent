@@ -423,43 +423,43 @@ class HumanMouseSimulator:
         dy_tgt = target_y - start_y
         dist_tgt = math.hypot(dx_tgt, dy_tgt)
 
-        if dist_tgt > 1e-3 and (ctx_arr[0] != 0.0 or ctx_arr[1] != 0.0):
+        vx_residual = float(ctx_arr[0] * self.display_w)
+        vy_residual = float(ctx_arr[1] * self.display_h)
+        v_residual_mag = float(math.hypot(vx_residual, vy_residual))
+        vx_gated = vx_residual
+        vy_gated = vy_residual
+
+        if dist_tgt > 1e-3 and v_residual_mag > 1e-3:
             u_x = dx_tgt / dist_tgt
             u_y = dy_tgt / dist_tgt
 
-            # Inflow velocity in screen pixels/second
-            vx_in_px = ctx_arr[0] * self.display_w
-            vy_in_px = ctx_arr[1] * self.display_h
-            v_in_mag = math.hypot(vx_in_px, vy_in_px)
+            # Dot product / projection onto target vector
+            v_parallel = vx_residual * u_x + vy_residual * u_y
+            cos_sim = v_parallel / v_residual_mag
 
-            if v_in_mag > 1e-3:
-                # Dot product / projection onto target vector
-                v_parallel = vx_in_px * u_x + vy_in_px * u_y
-                cos_sim = v_parallel / v_in_mag
+            # Decompose into parallel and perpendicular (normal/tangential) components
+            v_para_x = v_parallel * u_x
+            v_para_y = v_parallel * u_y
+            v_perp_x = vx_residual - v_para_x
+            v_perp_y = vy_residual - v_para_y
 
-                # Decompose into parallel and perpendicular (normal/tangential) components
-                v_para_x = v_parallel * u_x
-                v_para_y = v_parallel * u_y
-                v_perp_x = vx_in_px - v_para_x
-                v_perp_y = vy_in_px - v_para_y
+            if cos_sim <= 0.0:
+                # Opposing momentum (angle >= 90 deg):
+                # Suppress retrograde component so momentum does not project backward into negative progress.
+                # Retain only the perpendicular (tangential) component with graceful turning decay.
+                turn_damping = max(0.0, float(1.0 + cos_sim) ** 1.5)
+                vx_gated = v_perp_x * turn_damping
+                vy_gated = v_perp_y * turn_damping
+            else:
+                # Aligned momentum (acute angle < 90 deg):
+                # Retain forward and tangential components for fluid Bezier-like corner rounding
+                vx_gated = vx_residual
+                vy_gated = vy_residual
 
-                if cos_sim <= 0.0:
-                    # Opposing momentum (angle >= 90 deg):
-                    # Suppress retrograde component so momentum does not project backward into negative progress.
-                    # Retain only the perpendicular (tangential) component with graceful turning decay.
-                    turn_damping = max(0.0, float(1.0 + cos_sim) ** 1.5)
-                    vx_gated = v_perp_x * turn_damping
-                    vy_gated = v_perp_y * turn_damping
-                else:
-                    # Aligned momentum (acute angle < 90 deg):
-                    # Retain forward and tangential components for fluid Bezier-like corner rounding
-                    vx_gated = vx_in_px
-                    vy_gated = vy_in_px
-
-                ctx_arr[0] = float(vx_gated / self.display_w)
-                ctx_arr[1] = float(vy_gated / self.display_h)
-                if self.context_dim == 8:
-                    ctx_arr[7] = float(math.hypot(ctx_arr[0], ctx_arr[1]))
+            ctx_arr[0] = float(vx_gated / self.display_w)
+            ctx_arr[1] = float(vy_gated / self.display_h)
+            if self.context_dim == 8:
+                ctx_arr[7] = float(math.hypot(ctx_arr[0], ctx_arr[1]))
 
         ctx_t = torch.tensor([ctx_arr], dtype=torch.float32, device=self.device)
 
@@ -651,27 +651,42 @@ class HumanMouseSimulator:
                         "type": "move"
                     })
 
-        # Minimum-Jerk Transition Smoothing (Momentum Chaining):
-        # When active inflow momentum is present, blend transition velocity over the first 4-8 steps
-        # using a quintic minimum-jerk polynomial S(tau) = 10*tau^3 - 15*tau^4 + 6*tau^5.
-        # This guarantees C^2 continuity (eliminating delta a / dt jerk spikes) at waypoint junctions.
-        v_in_mag = math.hypot(vx_gated, vy_gated) if 'vx_gated' in locals() else 0.0
-        if v_in_mag > 15.0 and len(trajectory) >= 12:
-            K = min(6, len(trajectory) - 2)
-            orig_pts = [(p['x'], p['y']) for p in trajectory[:K + 1]]
+        # Neuromuscular Kinematic Shaping:
+        # Case 1: Neuromuscular Onset Inertia (Smoothstep / Cubic Ramp from Rest)
+        # When starting from rest (residual inflow momentum <= 15.0 px/s), arm inertia and motor unit
+        # recruitment latency prevent instantaneous acceleration jumps. Modulate early displacements
+        # via cubic smoothstep w(t) = 3*(t/K_ramp)^2 - 2*(t/K_ramp)^3 over the initial K_ramp steps (~30-50 ms)
+        # so acceleration builds continuously from zero instead of snapping to +35,000 px/s^2.
+        if v_residual_mag <= 15.0 and len(trajectory) >= 10:
+            K_ramp = min(7, len(trajectory) - 2)
+            p0_x, p0_y = trajectory[0]['x'], trajectory[0]['y']
+            for step_k in range(1, K_ramp + 1):
+                tau = step_k / float(K_ramp)
+                w = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
+                trajectory[step_k]['x'] = p0_x + (trajectory[step_k]['x'] - p0_x) * w
+                trajectory[step_k]['y'] = p0_y + (trajectory[step_k]['y'] - p0_y) * w
 
-            for step_i in range(1, K + 1):
-                tau = step_i / float(K + 1)
-                s_tau = 10.0 * (tau ** 3) - 15.0 * (tau ** 4) + 6.0 * (tau ** 5)
-                w_in = 1.0 - s_tau
-                w_model = s_tau
+        # Case 2: Waypoint Momentum Blending (Jerk-Free Transition)
+        # At waypoint transitions (momentum chaining with v_residual_mag > 15.0 px/s), apply a smooth
+        # cosine/smoothstep blend to the incoming residual velocity over the initial K_blend steps (6-10 steps)
+        # of the secondary segment. Ensures derivative of acceleration (Jerk) remains continuous,
+        # completely eliminating the vertical +38,000 px/s^2 spike at the transition boundary.
+        elif v_residual_mag > 15.0 and len(trajectory) >= 12:
+            K_blend = min(8, len(trajectory) - 2)
+            orig_pts = [(p['x'], p['y']) for p in trajectory[:K_blend + 1]]
+
+            for step_i in range(1, K_blend + 1):
+                tau = step_i / float(K_blend + 1)
+                # Cosine blend: 0.5 * (1 - cos(pi * tau))
+                w_model = 0.5 * (1.0 - math.cos(math.pi * tau))
+                w_in = 1.0 - w_model
 
                 dt_i = max(0.007, trajectory[step_i]['dt_ms'] / 1000.0)
                 v_model_x = (orig_pts[step_i][0] - orig_pts[step_i - 1][0]) / dt_i
                 v_model_y = (orig_pts[step_i][1] - orig_pts[step_i - 1][1]) / dt_i
 
-                v_blended_x = w_in * vx_gated + w_model * v_model_x
-                v_blended_y = w_in * vy_gated + w_model * v_model_y
+                v_blended_x = w_in * vx_residual + w_model * v_model_x
+                v_blended_y = w_in * vy_residual + w_model * v_model_y
 
                 new_x = trajectory[step_i - 1]['x'] + v_blended_x * dt_i
                 new_y = trajectory[step_i - 1]['y'] + v_blended_y * dt_i
@@ -679,15 +694,16 @@ class HumanMouseSimulator:
                 trajectory[step_i]['x'] = float(new_x)
                 trajectory[step_i]['y'] = float(new_y)
 
-            # Feather coordinate offset smoothly across subsequent 10 steps to prevent drift
-            delta_x = trajectory[K]['x'] - orig_pts[K][0]
-            delta_y = trajectory[K]['y'] - orig_pts[K][1]
-            feather_steps = min(10, len(trajectory) - 1 - K)
+            # Feather coordinate offset smoothly across subsequent steps to prevent trajectory drift
+            delta_x = trajectory[K_blend]['x'] - orig_pts[K_blend][0]
+            delta_y = trajectory[K_blend]['y'] - orig_pts[K_blend][1]
+            feather_steps = min(12, len(trajectory) - 1 - K_blend)
             for j in range(1, feather_steps + 1):
-                idx = K + j
+                idx = K_blend + j
                 decay = 1.0 - (j / float(feather_steps + 1))
                 trajectory[idx]['x'] += delta_x * decay
                 trajectory[idx]['y'] += delta_y * decay
+
 
         return trajectory
 
@@ -726,26 +742,37 @@ class HumanMouse:
 
     def generate_trajectory(self, start_pos, target_pos, prev_context=None, intent=1.0, target_radius=5.0):
         """Generates AI trajectory sequence without executing physical mouse movement."""
+        ctx = prev_context if prev_context is not None else self.prev_context
         raw_traj = self.simulator.generate_trajectory(
             start_pos=start_pos,
             target_pos=target_pos,
-            prev_context=prev_context if prev_context is not None else self.prev_context,
+            prev_context=ctx,
             intent=intent,
             target_radius=target_radius
         )
-        return self.apply_biomechanical_kinematic_filter(raw_traj)
+        in_vel = (ctx[0] * self.screen_w, ctx[1] * self.screen_h) if (ctx is not None and len(ctx) >= 2) else None
+        return self.apply_biomechanical_kinematic_filter(raw_traj, incoming_velocity=in_vel)
 
     @staticmethod
-    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=None, max_velocity=None, max_acceleration=45000.0, min_dt_ms=7.0):
+    def apply_biomechanical_kinematic_filter(trajectory, v_threshold=None, max_velocity=None, max_acceleration=20000.0, min_dt_ms=7.0, split_idx=None, incoming_velocity=None):
         """
         Global Biomechanical Safety Filter.
         Enforces continuous physiological constraints across single or multi-segment paths:
-          1. Continuous Savitzky-Golay coordinate smoothing (eliminates quantization staircasing).
-          2. Soft dynamic velocity shaping via algebraic saturation and Fitts-scaled dynamic ceiling:
-             v_sat = v_raw / (1 + (v_raw / effective_v_max)^4)^(1/4)
-             Eliminates flatline plateaus and preserves the natural biological bell curve crest.
-          3. Strict lower-bound on delta time: dt >= 7.0 ms (125-142 Hz hardware polling).
-          4. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration.
+          1. Strict hardware polling lower bound: dt >= min_dt_ms (default 7.0 ms, 125-142 Hz polling).
+          2. Continuous Savitzky-Golay coordinate smoothing (eliminates quantization staircasing)
+             with boundary anchoring.
+          3. Neuromuscular Onset Inertia (Smoothstep / Cubic Ramp):
+             For movements initiated from rest, modulates early displacements by w(t) = 3(t/K)^2 - 2(t/K)^3
+             over the initial K_ramp steps (~30-50 ms), building acceleration smoothly from zero.
+          4. Waypoint Transition Momentum Blending:
+             When chained across waypoints (split_idx provided), applies a cosine/smoothstep blend
+             to the incoming residual velocity over the secondary segment onset, eliminating vertical jerk spikes.
+          5. Distance-Adaptive Peak Velocity Rescaling (Soft Elastic Cap):
+             Calculates biologically plausible peak velocity V_max(D) = V_base + alpha * sqrt(D)
+             (V_base ~ 800 px/s, softly guided between 1500 and 2300 px/s).
+             Smoothly rescales velocity profile via soft algebraic compression:
+             v_sat = v_raw / (1 + (v_raw / V_max)^4)^(1/4), preserving bell-curve geometry without plateaus.
+          6. Forward-backward velocity profiling bounding acceleration |a| <= max_acceleration (default 20,000 px/s^2).
         """
         if not trajectory or len(trajectory) < 3:
             return trajectory
@@ -773,7 +800,56 @@ class HumanMouse:
             s_xs[0], s_ys[0] = xs[0], ys[0]
             s_xs[-1], s_ys[-1] = xs[-1], ys[-1]
         else:
-            s_xs, s_ys = xs, ys
+            s_xs, s_ys = xs.copy(), ys.copy()
+
+        # 3. Neuromuscular Onset Inertia (Smoothstep / Cubic Ramp from Rest)
+        # Apply cubic ramp if movement starts from rest (no incoming momentum or < 15 px/s)
+        K_ramp = min(7, N - 2)
+        if (incoming_velocity is None or np.hypot(incoming_velocity[0], incoming_velocity[1]) < 15.0) and K_ramp >= 2:
+            p0_x, p0_y = s_xs[0], s_ys[0]
+            for t in range(1, K_ramp + 1):
+                tau = t / float(K_ramp)
+                w = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
+                s_xs[t] = p0_x + (s_xs[t] - p0_x) * w
+                s_ys[t] = p0_y + (s_ys[t] - p0_y) * w
+
+        # 4. Waypoint Transition Momentum Blending (Multi-Segment Jerk-Free Transition)
+        if split_idx is not None and 0 < split_idx < N - 10:
+            K_blend = min(8, N - 1 - split_idx)
+            dt_pre = max(min_dt_ms, out[split_idx]['dt_ms']) / 1000.0
+            v_arr_x = (s_xs[split_idx] - s_xs[split_idx - 1]) / dt_pre
+            v_arr_y = (s_ys[split_idx] - s_ys[split_idx - 1]) / dt_pre
+
+            curr_x, curr_y = s_xs[split_idx], s_ys[split_idx]
+            orig_seg2_x = s_xs[split_idx:split_idx + K_blend + 1].copy()
+            orig_seg2_y = s_ys[split_idx:split_idx + K_blend + 1].copy()
+
+            for step_i in range(1, K_blend + 1):
+                idx = split_idx + step_i
+                tau = step_i / float(K_blend + 1)
+                w_mod = 0.5 * (1.0 - math.cos(math.pi * tau))
+                w_in = 1.0 - w_mod
+                dt_i = max(min_dt_ms, out[idx]['dt_ms']) / 1000.0
+
+                v_mod_x = (orig_seg2_x[step_i] - orig_seg2_x[step_i - 1]) / dt_i
+                v_mod_y = (orig_seg2_y[step_i] - orig_seg2_y[step_i - 1]) / dt_i
+
+                v_blend_x = w_in * v_arr_x + w_mod * v_mod_x
+                v_blend_y = w_in * v_arr_y + w_mod * v_mod_y
+
+                curr_x += v_blend_x * dt_i
+                curr_y += v_blend_y * dt_i
+                s_xs[idx] = curr_x
+                s_ys[idx] = curr_y
+
+            # Feather coordinate difference smoothly over next downstream steps
+            delta_x = s_xs[split_idx + K_blend] - orig_seg2_x[-1]
+            delta_y = s_ys[split_idx + K_blend] - orig_seg2_y[-1]
+            feather_steps = min(12, N - 1 - (split_idx + K_blend))
+            for j in range(1, feather_steps + 1):
+                decay = 1.0 - (j / float(feather_steps + 1))
+                s_xs[split_idx + K_blend + j] += delta_x * decay
+                s_ys[split_idx + K_blend + j] += delta_y * decay
 
         for i in range(N):
             out[i]['x'] = s_xs[i]
@@ -783,18 +859,22 @@ class HumanMouse:
         raw_dts = np.array([p['dt_ms'] / 1000.0 for p in out[1:]], dtype=np.float64)
         v_raw = dists / np.maximum(1e-4, raw_dts)
 
-        # 3. Dynamic Distance-Adaptive Fitts Ceiling & Continuous Algebraic Soft Saturation
-        # Eliminates horizontal flatlines by maintaining strictly positive derivative d(v_sat)/d(v_raw) > 0.
+        # 5. Distance-Adaptive Peak Velocity Rescaling (Soft Elastic Cap)
+        # V_max(D) = V_base + alpha * sqrt(D)
+        # Guided between 1500 px/s and 2300 px/s for typical movements
         total_dist = float(np.sum(dists))
-        fitts_ceiling = max(4500.0, 160.0 * math.sqrt(max(1.0, total_dist)))
-        if max_velocity is not None and max_velocity > 2800.0:
-            effective_v_max = max(float(max_velocity), fitts_ceiling)
+        v_base = 800.0
+        alpha = 42.0
+        v_max_fitts = float(np.clip(v_base + alpha * math.sqrt(max(1.0, total_dist)), 1400.0, 2400.0))
+        if max_velocity is not None and max_velocity > 0:
+            effective_v_max = min(float(max_velocity), v_max_fitts)
         else:
-            effective_v_max = fitts_ceiling
+            effective_v_max = v_max_fitts
 
+        # Soft algebraic compression: preserves bell curve without horizontal flatlines
         v_sat = v_raw / ((1.0 + (v_raw / effective_v_max) ** 4) ** 0.25)
 
-        # 4. Dynamic Forward-Backward Acceleration Limiting
+        # 6. Dynamic Forward-Backward Acceleration Limiting
         effective_a_max = max_acceleration * 0.90
         dt_clamped = np.maximum(min_dt_ms / 1000.0, dists / np.maximum(1e-4, v_sat))
 
@@ -835,6 +915,7 @@ class HumanMouse:
             out[i]['dt_ms'] = round(dt_clamped[i-1] * 1000.0, 3)
 
         return out
+
 
     def _execute_trajectory(self, trajectory, perform_click=False, button='left'):
         """Executes generated trajectory points with sub-millisecond precision timing and Windows multimedia timer."""
